@@ -82,7 +82,7 @@ export class VoiceView extends ItemView {
   }
 
   private async doConnect(): Promise<void> {
-    const { openaiApiKey, voice, systemPromptExtra } = this.plugin.settings;
+    const { openaiApiKey, model, voice, systemPromptExtra } = this.plugin.settings;
 
     if (!openaiApiKey) {
       new Notice('Voice: no OpenAI API key configured. Open Settings to add one.');
@@ -96,7 +96,7 @@ export class VoiceView extends ItemView {
     this.clearTranscript();
     this.connectBtn.disabled = true;
 
-    await this.session.connect(openaiApiKey, voice, systemPrompt, {
+    await this.session.connect(openaiApiKey, model, voice, systemPrompt, {
       onStatusChange: (status) => {
         this.updateStatus(status);
         if (status === 'connected') {

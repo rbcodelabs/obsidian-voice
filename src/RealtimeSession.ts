@@ -18,32 +18,38 @@ export class RealtimeSession {
 
   async connect(
     apiKey: string,
+    model: string,
     voice: string,
     systemPrompt: string,
     callbacks: SessionCallbacks
   ): Promise<void> {
     callbacks.onStatusChange('connecting');
 
-    // Step 1: fetch ephemeral token
+    // Step 1: fetch ephemeral token via GA client_secrets endpoint
     let ephemeralToken: string;
     try {
-      const tokenRes = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      const tokenRes = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'gpt-4o-realtime-preview',
-          voice,
+          session: {
+            type: 'realtime',
+            model,
+            audio: {
+              output: { voice },
+            },
+          },
         }),
       });
       if (!tokenRes.ok) {
         const err = await tokenRes.text();
         throw new Error(`Token fetch failed (${tokenRes.status}): ${err}`);
       }
-      const tokenData = await tokenRes.json() as { client_secret: { value: string } };
-      ephemeralToken = tokenData.client_secret.value;
+      const tokenData = await tokenRes.json() as { value: string };
+      ephemeralToken = tokenData.value;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       callbacks.onError(`Failed to create session: ${msg}`);
@@ -123,22 +129,19 @@ export class RealtimeSession {
       }
     };
 
-    // Step 6: SDP negotiation
+    // Step 6: SDP negotiation via GA /v1/realtime/calls endpoint
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
 
-      const sdpRes = await fetch(
-        'https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${ephemeralToken}`,
-            'Content-Type': 'application/sdp',
-          },
-          body: offer.sdp,
-        }
-      );
+      const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ephemeralToken}`,
+          'Content-Type': 'application/sdp',
+        },
+        body: offer.sdp,
+      });
 
       if (!sdpRes.ok) {
         const err = await sdpRes.text();

@@ -1,16 +1,24 @@
 import { App, PluginSettingTab, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 
+export type RealtimeModel = 'gpt-realtime' | 'gpt-realtime-mini';
+export type RealtimeVoice =
+  | 'alloy' | 'ash' | 'ballad' | 'cedar' | 'coral'
+  | 'echo' | 'fable' | 'marin' | 'nova' | 'onyx'
+  | 'sage' | 'shimmer' | 'verse';
+
 export interface VoiceSettings {
   openaiApiKey: string;
-  voice: 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer';
+  model: RealtimeModel;
+  voice: RealtimeVoice;
   systemPromptExtra: string;
   autoApplyEdits: boolean;
 }
 
 export const DEFAULT_SETTINGS: VoiceSettings = {
   openaiApiKey: '',
-  voice: 'alloy',
+  model: 'gpt-realtime',
+  voice: 'marin',
   systemPromptExtra: '',
   autoApplyEdits: true,
 };
@@ -45,19 +53,40 @@ export class VoiceSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName('Voice')
-      .setDesc('The voice the AI will use when speaking.')
+      .setName('Model')
+      .setDesc('gpt-realtime is the full model; gpt-realtime-mini is faster and cheaper.')
       .addDropdown(drop => {
         drop
+          .addOption('gpt-realtime', 'gpt-realtime (recommended)')
+          .addOption('gpt-realtime-mini', 'gpt-realtime-mini (faster / cheaper)')
+          .setValue(this.plugin.settings.model)
+          .onChange(async (value) => {
+            this.plugin.settings.model = value as RealtimeModel;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Voice')
+      .setDesc('The voice the AI will use when speaking. Marin and Cedar are Realtime-exclusive.')
+      .addDropdown(drop => {
+        drop
+          .addOption('marin', 'Marin (recommended)')
+          .addOption('cedar', 'Cedar')
           .addOption('alloy', 'Alloy')
+          .addOption('ash', 'Ash')
+          .addOption('ballad', 'Ballad')
+          .addOption('coral', 'Coral')
           .addOption('echo', 'Echo')
           .addOption('fable', 'Fable')
-          .addOption('onyx', 'Onyx')
           .addOption('nova', 'Nova')
+          .addOption('onyx', 'Onyx')
+          .addOption('sage', 'Sage')
           .addOption('shimmer', 'Shimmer')
+          .addOption('verse', 'Verse')
           .setValue(this.plugin.settings.voice)
           .onChange(async (value) => {
-            this.plugin.settings.voice = value as VoiceSettings['voice'];
+            this.plugin.settings.voice = value as RealtimeVoice;
             await this.plugin.saveSettings();
           });
       });
