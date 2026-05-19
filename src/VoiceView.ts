@@ -2,6 +2,7 @@ import { ItemView, MarkdownView, Notice, WorkspaceLeaf } from 'obsidian';
 import type VoicePlugin from './main';
 import { RealtimeSession, SessionStatus } from './RealtimeSession';
 import { executeToolCall } from './DocumentTools';
+import { REALTIME_MODEL } from './settings';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
@@ -20,12 +21,14 @@ export class VoiceView extends ItemView {
   private statusDot!: HTMLElement;
   private statusText!: HTMLElement;
   private connectBtn!: HTMLButtonElement;
+  private contextBanner!: HTMLElement;
   private transcriptContainer!: HTMLElement;
 
   // Transcript state
   private entries: TranscriptEntry[] = [];
   private pendingAssistant: TranscriptEntry | null = null;
   private pendingUser: TranscriptEntry | null = null;
+  private pendingToolEls = new Map<string, HTMLElement>();
 
   constructor(leaf: WorkspaceLeaf, plugin: VoicePlugin) {
     super(leaf);
@@ -61,6 +64,15 @@ export class VoiceView extends ItemView {
     });
     this.connectBtn.addEventListener('click', () => this.handleConnectToggle());
 
+    // Context banner — shows which file will be sent as context
+    this.contextBanner = root.createDiv({ cls: 'voice-context-banner' });
+    this.updateContextBanner();
+
+    // Update banner whenever the active leaf changes
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => this.updateContextBanner())
+    );
+
     // Transcript container
     this.transcriptContainer = root.createDiv({ cls: 'voice-transcript' });
 
@@ -73,12 +85,16 @@ export class VoiceView extends ItemView {
     this.isConnected = false;
   }
 
-  private async handleConnectToggle(): Promise<void> {
+  async toggleConnection(): Promise<void> {
     if (this.isConnected) {
       this.doDisconnect();
     } else {
       await this.doConnect();
     }
+  }
+
+  private async handleConnectToggle(): Promise<void> {
+    return this.toggleConnection();
   }
 
   private async doConnect(): Promise<void> {
@@ -89,6 +105,7 @@ export class VoiceView extends ItemView {
       return;
     }
 
+    const view = this.getMarkdownView();
     const docContent = this.getCurrentDocContent();
     const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra);
 
@@ -96,13 +113,20 @@ export class VoiceView extends ItemView {
     this.clearTranscript();
     this.connectBtn.disabled = true;
 
-    await this.session.connect(openaiApiKey, voice, systemPrompt, {
+    await this.session.connect(openaiApiKey, REALTIME_MODEL, voice, systemPrompt, {
       onStatusChange: (status) => {
         this.updateStatus(status);
         if (status === 'connected') {
           this.isConnected = true;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
+          // Show what file was captured as context
+          if (view?.file) {
+            const chars = docContent.length.toLocaleString();
+            this.addToolEvent(`Context snapshot: ${view.file.name} · ${chars} chars`);
+          } else {
+            this.addToolEvent('Context snapshot: no document open');
+          }
         } else if (status === 'idle' || status === 'error') {
           this.isConnected = false;
           this.connectBtn.disabled = false;
@@ -113,21 +137,30 @@ export class VoiceView extends ItemView {
       onTranscript: (role, text, done) => {
         this.handleTranscript(role, text, done);
       },
-      onToolCall: (_callId, name, _args) => {
-        this.addToolEvent(this.formatToolName(name));
+      onToolCall: (callId, name, argsJson) => {
+        const label = this.formatToolLabel(name, argsJson);
+        const el = this.addToolEvent(label);
+        this.pendingToolEls.set(callId, el);
       },
       onError: (msg) => {
         new Notice(`Voice error: ${msg}`);
         this.addToolEvent(`Error: ${msg}`);
       },
-      getToolResult: (_callId, name, argsJson) => {
+      getToolResult: async (callId, name, argsJson) => {
         let args: Record<string, unknown> = {};
         try {
           args = JSON.parse(argsJson) as Record<string, unknown>;
         } catch {
           return `Error: could not parse tool arguments`;
         }
-        return executeToolCall(name, args, this.app);
+        const result = await executeToolCall(name, args, this.app);
+        // Update the pill with outcome
+        const el = this.pendingToolEls.get(callId);
+        if (el) {
+          el.textContent = this.formatToolResult(name, argsJson, result);
+          this.pendingToolEls.delete(callId);
+        }
+        return result;
       },
     });
   }
@@ -140,10 +173,36 @@ export class VoiceView extends ItemView {
     this.updateStatus('idle');
   }
 
+  private getMarkdownView(): MarkdownView | null {
+    const leaves = this.app.workspace.getLeavesOfType('markdown');
+    if (leaves.length === 0) return null;
+    const view = leaves[0].view as MarkdownView;
+    return view.file ? view : null;
+  }
+
   private getCurrentDocContent(): string {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const view = this.getMarkdownView();
     if (!view) return '(no document currently open)';
     return view.editor.getValue();
+  }
+
+  private updateContextBanner(): void {
+    const view = this.getMarkdownView();
+    this.contextBanner.empty();
+    if (view?.file) {
+      const charCount = view.editor.getValue().length;
+      this.contextBanner.createSpan({ cls: 'voice-context-banner__label', text: 'Context: ' });
+      this.contextBanner.createSpan({ cls: 'voice-context-banner__file', text: view.file.name });
+      this.contextBanner.createSpan({
+        cls: 'voice-context-banner__chars',
+        text: ` · ${charCount.toLocaleString()} chars`,
+      });
+    } else {
+      this.contextBanner.createSpan({
+        cls: 'voice-context-banner__none',
+        text: 'No document open — AI will have no context',
+      });
+    }
   }
 
   private buildSystemPrompt(docContent: string, extra: string): string {
@@ -226,22 +285,73 @@ export class VoiceView extends ItemView {
     return wrapper;
   }
 
-  private addToolEvent(label: string): void {
-    this.transcriptContainer.createDiv({
+  private addToolEvent(label: string): HTMLElement {
+    const el = this.transcriptContainer.createDiv({
       cls: 'voice-tool-event',
       text: label,
     });
     this.scrollToBottom();
+    return el;
   }
 
-  private formatToolName(name: string): string {
-    const labels: Record<string, string> = {
-      get_document: 'Read document',
-      append_note: 'Appended note',
-      insert_at_cursor: 'Inserted text',
-      replace_document: 'Replaced document',
-    };
-    return labels[name] ?? name;
+  // Label shown while tool is executing
+  private formatToolLabel(name: string, argsJson: string): string {
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(argsJson) as Record<string, unknown>; } catch { /* ok */ }
+
+    switch (name) {
+      case 'search_vault':
+        return `Searching vault · "${args.query as string ?? ''}"…`;
+      case 'open_file':
+        return `Opening · ${args.filename as string ?? ''}…`;
+      case 'get_document':
+        return 'Reading document…';
+      case 'append_note':
+        return 'Appending note…';
+      case 'insert_at_cursor':
+        return 'Inserting text…';
+      case 'replace_document':
+        return 'Replacing document…';
+      case 'get_links':
+        return 'Getting links…';
+      default:
+        return `${name}…`;
+    }
+  }
+
+  // Label shown after tool completes
+  private formatToolResult(name: string, argsJson: string, result: string): string {
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(argsJson) as Record<string, unknown>; } catch { /* ok */ }
+
+    const isError = result.startsWith('Error:');
+
+    switch (name) {
+      case 'search_vault': {
+        if (isError) return `Search failed · "${args.query as string ?? ''}"`;
+        const count = (result.match(/^\d+\./gm) ?? []).length;
+        return `Searched vault · "${args.query as string ?? ''}" · ${count} result${count !== 1 ? 's' : ''}`;
+      }
+      case 'open_file': {
+        if (isError) return `File not found · ${args.filename as string ?? ''}`;
+        return `Opened · ${args.filename as string ?? ''}`;
+      }
+      case 'get_document':
+        return isError ? 'Read document · no file open' : 'Read document';
+      case 'append_note':
+        return isError ? 'Append failed' : 'Appended note';
+      case 'insert_at_cursor':
+        return isError ? 'Insert failed' : 'Inserted text';
+      case 'replace_document':
+        return isError ? 'Replace failed' : 'Replaced document';
+      case 'get_links': {
+        if (isError) return 'Got links · no file open';
+        const count = (result.match(/^- /gm) ?? []).length;
+        return `Got links · ${count} link${count !== 1 ? 's' : ''}`;
+      }
+      default:
+        return isError ? `${name} failed` : name;
+    }
   }
 
   private clearTranscript(): void {
@@ -249,6 +359,7 @@ export class VoiceView extends ItemView {
     this.entries = [];
     this.pendingAssistant = null;
     this.pendingUser = null;
+    this.pendingToolEls.clear();
   }
 
   private scrollToBottom(): void {

@@ -1,4 +1,4 @@
-import { App, MarkdownView, Notice } from 'obsidian';
+import { App, MarkdownView, Notice, TFile } from 'obsidian';
 
 export const DOCUMENT_TOOLS = [
   {
@@ -57,19 +57,60 @@ export const DOCUMENT_TOOLS = [
       required: ['content'],
     },
   },
+  {
+    type: 'function',
+    name: 'search_vault',
+    description: 'Search all vault notes by filename and content. Returns matching file paths and excerpts.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Text to search for (case-insensitive)' },
+        limit: { type: 'number', description: 'Max results to return (default 5, max 10)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'open_file',
+    description: 'Open a vault note by filename or path in a new tab.',
+    parameters: {
+      type: 'object',
+      properties: {
+        filename: {
+          type: 'string',
+          description: 'Filename or path of the note to open (e.g. "My Note" or "folder/My Note.md")',
+        },
+      },
+      required: ['filename'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'get_links',
+    description: 'Get all outgoing wikilinks from the current document.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
 function getActiveEditor(app: App) {
-  const view = app.workspace.getActiveViewOfType(MarkdownView);
-  if (!view) return null;
-  return view.editor;
+  // getActiveViewOfType returns null when a sidebar panel (like VoiceView) is focused.
+  // Use getLeavesOfType to find the markdown editor regardless of focus.
+  const leaves = app.workspace.getLeavesOfType('markdown');
+  if (leaves.length === 0) return null;
+  const view = leaves[0].view as MarkdownView;
+  return view.file ? view.editor : null;
 }
 
-export function executeToolCall(
+export async function executeToolCall(
   name: string,
   args: Record<string, unknown>,
   app: App
-): string {
+): Promise<string> {
   const editor = getActiveEditor(app);
 
   if (name === 'get_document') {
@@ -102,6 +143,80 @@ export function executeToolCall(
     editor.setValue(content);
     new Notice('Voice: replaced document content');
     return 'Document replaced successfully.';
+  }
+
+  if (name === 'search_vault') {
+    const query = String(args.query ?? '').toLowerCase();
+    const limit = Math.min(Number(args.limit ?? 5), 10);
+    if (!query) return 'Error: query is required';
+
+    const files = app.vault.getMarkdownFiles();
+    const results: { path: string; excerpt: string; score: number }[] = [];
+
+    for (const file of files) {
+      const nameMatch = file.basename.toLowerCase().includes(query);
+      let content = '';
+      try {
+        content = await app.vault.cachedRead(file);
+      } catch {
+        continue;
+      }
+      const lower = content.toLowerCase();
+      const contentIdx = lower.indexOf(query);
+      if (!nameMatch && contentIdx === -1) continue;
+
+      const score = (nameMatch ? 10 : 0) + (contentIdx !== -1 ? 1 : 0);
+      let excerpt = '';
+      if (contentIdx !== -1) {
+        const start = Math.max(0, contentIdx - 60);
+        const end = Math.min(content.length, contentIdx + query.length + 120);
+        excerpt =
+          (start > 0 ? '…' : '') +
+          content.slice(start, end).replace(/\n+/g, ' ').trim() +
+          (end < content.length ? '…' : '');
+      }
+      results.push({ path: file.path, excerpt, score });
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    const top = results.slice(0, limit);
+    if (top.length === 0) return `No results found for "${args.query}"`;
+    return top
+      .map((r, i) => {
+        const lines = [`${i + 1}. ${r.path}`];
+        if (r.excerpt) lines.push(`   "${r.excerpt}"`);
+        return lines.join('\n');
+      })
+      .join('\n\n');
+  }
+
+  if (name === 'open_file') {
+    const filename = String(args.filename ?? '');
+    if (!filename) return 'Error: filename is required';
+    const file =
+      app.metadataCache.getFirstLinkpathDest(filename, '') ??
+      app.vault.getAbstractFileByPath(filename);
+    if (!file || !(file instanceof TFile)) return `Error: file not found: "${filename}"`;
+    try {
+      const leaf = app.workspace.getLeaf('tab');
+      await leaf.openFile(file);
+      new Notice(`Voice: opened ${file.name}`);
+      return `Opened ${file.path}`;
+    } catch (e) {
+      return `Error opening file: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  if (name === 'get_links') {
+    const leaves = app.workspace.getLeavesOfType('markdown');
+    if (leaves.length === 0) return 'Error: no document open';
+    const view = leaves[0].view as MarkdownView;
+    if (!view.file) return 'Error: no document open';
+    const cache = app.metadataCache.getFileCache(view.file);
+    const links = cache?.links ?? [];
+    if (links.length === 0) return 'No outgoing links found in current document';
+    const unique = [...new Set(links.map((l) => l.original))];
+    return `Links in ${view.file.name}:\n` + unique.map((l) => `- ${l}`).join('\n');
   }
 
   return `Error: unknown tool "${name}"`;

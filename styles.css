@@ -78,6 +78,43 @@
   cursor: not-allowed;
 }
 
+/* Context banner */
+
+.voice-context-banner {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  font-size: 0.78em;
+  line-height: 1.4;
+}
+
+.voice-context-banner__label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.voice-context-banner__file {
+  color: var(--text-normal);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-context-banner__chars {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.voice-context-banner__none {
+  color: var(--text-error);
+  font-style: italic;
+}
+
 /* Transcript container */
 
 .voice-transcript {
