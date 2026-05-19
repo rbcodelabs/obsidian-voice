@@ -1,7 +1,8 @@
 import { App, PluginSettingTab, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 
-export type RealtimeModel = 'gpt-realtime' | 'gpt-realtime-mini';
+export const REALTIME_MODEL = 'gpt-realtime-2';
+
 export type RealtimeVoice =
   | 'alloy' | 'ash' | 'ballad' | 'cedar' | 'coral'
   | 'echo' | 'fable' | 'marin' | 'nova' | 'onyx'
@@ -9,7 +10,6 @@ export type RealtimeVoice =
 
 export interface VoiceSettings {
   openaiApiKey: string;
-  model: RealtimeModel;
   voice: RealtimeVoice;
   systemPromptExtra: string;
   autoApplyEdits: boolean;
@@ -17,7 +17,6 @@ export interface VoiceSettings {
 
 export const DEFAULT_SETTINGS: VoiceSettings = {
   openaiApiKey: '',
-  model: 'gpt-realtime',
   voice: 'marin',
   systemPromptExtra: '',
   autoApplyEdits: true,
@@ -50,20 +49,6 @@ export class VoiceSettingTab extends PluginSettingTab {
           });
         text.inputEl.type = 'password';
         text.inputEl.style.width = '100%';
-      });
-
-    new Setting(containerEl)
-      .setName('Model')
-      .setDesc('gpt-realtime is the full model; gpt-realtime-mini is faster and cheaper.')
-      .addDropdown(drop => {
-        drop
-          .addOption('gpt-realtime', 'gpt-realtime (recommended)')
-          .addOption('gpt-realtime-mini', 'gpt-realtime-mini (faster / cheaper)')
-          .setValue(this.plugin.settings.model)
-          .onChange(async (value) => {
-            this.plugin.settings.model = value as RealtimeModel;
-            await this.plugin.saveSettings();
-          });
       });
 
     new Setting(containerEl)

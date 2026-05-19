@@ -18,6 +18,19 @@ export default class VoicePlugin extends Plugin {
       callback: () => this.activateView(),
     });
 
+    this.addCommand({
+      id: 'toggle-voice-connection',
+      name: 'Toggle Voice connection',
+      callback: async () => {
+        await this.activateView();
+        const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+        if (leaves.length > 0) {
+          const view = leaves[0].view as VoiceView;
+          await view.toggleConnection();
+        }
+      },
+    });
+
     this.addSettingTab(new VoiceSettingTab(this.app, this));
   }
 
