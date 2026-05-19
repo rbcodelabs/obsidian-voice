@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-voice",
+  "name": "Voice",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Talk with your documents using OpenAI Realtime Voice",
+  "author": "Rick Bowman",
+  "authorUrl": "https://github.com/richardbowman",
+  "isDesktopOnly": true
+}
