@@ -16,6 +16,10 @@ export class VoiceView extends ItemView {
   private plugin: VoicePlugin;
   private session: RealtimeSession | null = null;
   private isConnected = false;
+  // Tracks the last markdown tab the user focused. Stays populated even when
+  // the Voice panel itself is active, so Connect always targets the document
+  // you were just looking at.
+  private lastMarkdownView: MarkdownView | null = null;
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -66,11 +70,22 @@ export class VoiceView extends ItemView {
 
     // Context banner — shows which file will be sent as context
     this.contextBanner = root.createDiv({ cls: 'voice-context-banner' });
+
+    // Seed the tracker with whatever is already active when the panel opens.
+    // getActiveViewOfType works here because we haven't stolen focus yet.
+    this.lastMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
     this.updateContextBanner();
 
-    // Update banner whenever the active leaf changes
+    // Keep the tracker current as the user navigates tabs.
+    // When focus moves to the Voice panel the leaf is not a MarkdownView, so
+    // we leave lastMarkdownView alone — the previous document stays tracked.
     this.registerEvent(
-      this.app.workspace.on('active-leaf-change', () => this.updateContextBanner())
+      this.app.workspace.on('active-leaf-change', (leaf) => {
+        if (leaf?.view instanceof MarkdownView && leaf.view.file) {
+          this.lastMarkdownView = leaf.view as MarkdownView;
+        }
+        this.updateContextBanner();
+      })
     );
 
     // Transcript container
@@ -153,7 +168,7 @@ export class VoiceView extends ItemView {
         } catch {
           return `Error: could not parse tool arguments`;
         }
-        const result = await executeToolCall(name, args, this.app);
+        const result = await executeToolCall(name, args, this.app, this.lastMarkdownView);
         // Update the pill with outcome
         const el = this.pendingToolEls.get(callId);
         if (el) {
@@ -174,10 +189,7 @@ export class VoiceView extends ItemView {
   }
 
   private getMarkdownView(): MarkdownView | null {
-    const leaves = this.app.workspace.getLeavesOfType('markdown');
-    if (leaves.length === 0) return null;
-    const view = leaves[0].view as MarkdownView;
-    return view.file ? view : null;
+    return this.lastMarkdownView;
   }
 
   private getCurrentDocContent(): string {

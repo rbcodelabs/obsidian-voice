@@ -97,21 +97,19 @@ export const DOCUMENT_TOOLS = [
   },
 ];
 
-function getActiveEditor(app: App) {
-  // getActiveViewOfType returns null when a sidebar panel (like VoiceView) is focused.
-  // Use getLeavesOfType to find the markdown editor regardless of focus.
-  const leaves = app.workspace.getLeavesOfType('markdown');
-  if (leaves.length === 0) return null;
-  const view = leaves[0].view as MarkdownView;
-  return view.file ? view.editor : null;
+// Receives the view that VoiceView has been tracking via active-leaf-change,
+// which correctly follows tab switches even when the Voice panel has focus.
+function getActiveEditor(view: MarkdownView | null) {
+  return view?.file ? view.editor : null;
 }
 
 export async function executeToolCall(
   name: string,
   args: Record<string, unknown>,
-  app: App
+  app: App,
+  activeView: MarkdownView | null = null
 ): Promise<string> {
-  const editor = getActiveEditor(app);
+  const editor = getActiveEditor(activeView);
 
   if (name === 'get_document') {
     if (!editor) return 'Error: no document is currently open.';
@@ -208,15 +206,12 @@ export async function executeToolCall(
   }
 
   if (name === 'get_links') {
-    const leaves = app.workspace.getLeavesOfType('markdown');
-    if (leaves.length === 0) return 'Error: no document open';
-    const view = leaves[0].view as MarkdownView;
-    if (!view.file) return 'Error: no document open';
-    const cache = app.metadataCache.getFileCache(view.file);
+    if (!activeView?.file) return 'Error: no document open';
+    const cache = app.metadataCache.getFileCache(activeView.file);
     const links = cache?.links ?? [];
     if (links.length === 0) return 'No outgoing links found in current document';
     const unique = [...new Set(links.map((l) => l.original))];
-    return `Links in ${view.file.name}:\n` + unique.map((l) => `- ${l}`).join('\n');
+    return `Links in ${activeView.file.name}:\n` + unique.map((l) => `- ${l}`).join('\n');
   }
 
   return `Error: unknown tool "${name}"`;
