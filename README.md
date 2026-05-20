@@ -47,3 +47,47 @@ To assign a hotkey: Settings → Hotkeys → search "Toggle Voice connection".
 ## Model
 
 Uses `gpt-realtime-2` via the OpenAI Realtime API (WebRTC).
+
+## Release Process
+
+Follow these steps **in order**. Version files must be updated and committed **before** building — the artifacts uploaded to GitHub are snapshots of the files at build/upload time.
+
+1. **Bump versions first** (both files must match the new version):
+   ```bash
+   # Edit manifest.json  →  "version": "X.Y.Z"
+   # Edit package.json   →  "version": "X.Y.Z"
+   ```
+
+2. **Build** so the compiled output is based on the new version:
+   ```bash
+   npm run build
+   ```
+
+3. **Commit the version bump**:
+   ```bash
+   git add manifest.json package.json
+   git commit -m "chore: bump version to vX.Y.Z"
+   ```
+
+4. **Merge to master and push the tag**:
+   ```bash
+   git checkout master
+   git merge --ff-only <release-branch>
+   git tag vX.Y.Z
+   git push origin master --tags
+   ```
+
+5. **Create the GitHub release** with all three artifacts:
+   ```bash
+   gh release create vX.Y.Z main.js manifest.json styles.css \
+     --title "vX.Y.Z" \
+     --notes "Brief description of changes"
+   ```
+
+6. **Verify** the manifest version in the release matches the tag:
+   ```bash
+   gh release download vX.Y.Z --pattern manifest.json --output /tmp/check.json --clobber
+   cat /tmp/check.json   # "version" must equal X.Y.Z
+   ```
+
+> **Common mistake:** editing `manifest.json` *after* the build (or after `gh release create`) causes the old version to be uploaded as a release artifact even though the source file is correct. Always edit → build → commit → release.
