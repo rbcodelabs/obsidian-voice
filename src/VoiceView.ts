@@ -326,6 +326,10 @@ export class VoiceView extends ItemView {
         return 'Replacing document…';
       case 'get_links':
         return 'Getting links…';
+      case 'create_document':
+        return `Creating document · ${args.path as string ?? ''}…`;
+      case 'list_folder':
+        return `Listing folder · ${args.path as string || '/'}…`;
       default:
         return `${name}…`;
     }
@@ -360,6 +364,15 @@ export class VoiceView extends ItemView {
         if (isError) return 'Got links · no file open';
         const count = (result.match(/^- /gm) ?? []).length;
         return `Got links · ${count} link${count !== 1 ? 's' : ''}`;
+      }
+      case 'create_document': {
+        if (isError) return `Create failed · ${args.path as string ?? ''}`;
+        return `Created · ${args.path as string ?? ''}`;
+      }
+      case 'list_folder': {
+        if (isError) return `List failed · ${args.path as string || '/'}`;
+        const count = (result.match(/\n  /g) ?? []).length;
+        return `Listed · ${args.path as string || '/'} · ${count} item${count !== 1 ? 's' : ''}`;
       }
       default:
         return isError ? `${name} failed` : name;

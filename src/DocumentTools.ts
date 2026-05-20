@@ -1,4 +1,4 @@
-import { App, MarkdownView, Notice, TFile, WorkspaceLeaf } from 'obsidian';
+import { App, MarkdownView, Notice, TFile, TFolder, WorkspaceLeaf } from 'obsidian';
 
 export const DOCUMENT_TOOLS = [
   {
@@ -93,6 +93,53 @@ export const DOCUMENT_TOOLS = [
       type: 'object',
       properties: {},
       required: [],
+    },
+  },
+  {
+    type: 'function',
+    name: 'create_document',
+    description:
+      'Create a new note at the given vault path with optional content, then open it. ' +
+      'Intermediate folders are created automatically. ' +
+      'Returns an error if the file already exists.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'Vault-relative path for the new note, e.g. "Daily/2026-05-20.md". ' +
+            'The .md extension is added automatically if omitted.',
+        },
+        content: {
+          type: 'string',
+          description: 'Initial content for the note (optional, defaults to empty).',
+        },
+        open: {
+          type: 'boolean',
+          description: 'Whether to open the new note in a tab after creation (default true).',
+        },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'list_folder',
+    description:
+      'List the files and subfolders inside a vault folder. ' +
+      'Use this to browse the vault structure before deciding where to create a document.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'Vault-relative folder path to list, e.g. "Daily" or "Projects/Active". ' +
+            'Use "" or "/" for the vault root.',
+        },
+      },
+      required: ['path'],
     },
   },
 ];
@@ -224,6 +271,62 @@ export async function executeToolCall(
     if (links.length === 0) return 'No outgoing links found in current document';
     const unique = [...new Set(links.map((l) => l.original))];
     return `Links in ${activeView.file.name}:\n` + unique.map((l) => `- ${l}`).join('\n');
+  }
+
+  if (name === 'create_document') {
+    let notePath = String(args.path ?? '').trim();
+    if (!notePath) return 'Error: path is required';
+    if (!notePath.endsWith('.md')) notePath += '.md';
+    const shouldOpen = args.open !== false;
+    const content = String(args.content ?? '');
+
+    // Check for existing file
+    const existing = app.vault.getAbstractFileByPath(notePath);
+    if (existing) return `Error: file already exists at "${notePath}"`;
+
+    try {
+      // Create intermediate folders
+      const folderPath = notePath.includes('/') ? notePath.slice(0, notePath.lastIndexOf('/')) : '';
+      if (folderPath && !app.vault.getAbstractFileByPath(folderPath)) {
+        await app.vault.createFolder(folderPath);
+      }
+      const file = await app.vault.create(notePath, content);
+      if (shouldOpen) {
+        const leaf = app.workspace.getLeaf('tab');
+        await leaf.openFile(file);
+      }
+      new Notice(`Voice: created ${file.name}`);
+      return `Created ${notePath}${shouldOpen ? ' and opened it' : ''}`;
+    } catch (e) {
+      return `Error creating document: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  if (name === 'list_folder') {
+    const folderPath = String(args.path ?? '').replace(/^\//, '');
+    const folder =
+      folderPath === '' || folderPath === '/'
+        ? app.vault.getRoot()
+        : app.vault.getAbstractFileByPath(folderPath);
+
+    if (!folder || !(folder instanceof TFolder)) {
+      return `Error: folder not found: "${folderPath || '/'}"`;
+    }
+
+    const children = folder.children.slice().sort((a, b) => {
+      // Folders first, then files
+      const aIsFolder = a instanceof TFolder ? 0 : 1;
+      const bIsFolder = b instanceof TFolder ? 0 : 1;
+      if (aIsFolder !== bIsFolder) return aIsFolder - bIsFolder;
+      return a.name.localeCompare(b.name);
+    });
+
+    if (children.length === 0) return `Folder "${folderPath || '/'}" is empty`;
+
+    const lines = children.map((c) =>
+      c instanceof TFolder ? `📁 ${c.name}/` : `📄 ${c.name}`
+    );
+    return `Contents of "${folderPath || '/'}":${lines.map((l) => `\n  ${l}`).join('')}`;
   }
 
   return `Error: unknown tool "${name}"`;
