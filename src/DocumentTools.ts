@@ -1,4 +1,4 @@
-import { App, MarkdownView, Notice, TFile } from 'obsidian';
+import { App, MarkdownView, Notice, TFile, WorkspaceLeaf } from 'obsidian';
 
 export const DOCUMENT_TOOLS = [
   {
@@ -196,6 +196,18 @@ export async function executeToolCall(
       app.vault.getAbstractFileByPath(filename);
     if (!file || !(file instanceof TFile)) return `Error: file not found: "${filename}"`;
     try {
+      // Reuse an existing leaf if the file is already open somewhere.
+      let existingLeaf: WorkspaceLeaf | null = null;
+      app.workspace.iterateAllLeaves((l) => {
+        if (l.view instanceof MarkdownView && l.view.file?.path === file.path) {
+          existingLeaf = l;
+        }
+      });
+      if (existingLeaf) {
+        app.workspace.revealLeaf(existingLeaf);
+        new Notice(`Voice: switched to ${file.name}`);
+        return `Switched to already-open ${file.path}`;
+      }
       const leaf = app.workspace.getLeaf('tab');
       await leaf.openFile(file);
       new Notice(`Voice: opened ${file.name}`);
