@@ -2,7 +2,7 @@ import { ItemView, MarkdownView, Notice, WorkspaceLeaf } from 'obsidian';
 import type VoicePlugin from './main';
 import { RealtimeSession, SessionStatus } from './RealtimeSession';
 import { executeToolCall } from './DocumentTools';
-import { REALTIME_MODEL } from './settings';
+import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
@@ -113,9 +113,10 @@ export class VoiceView extends ItemView {
   }
 
   private async doConnect(): Promise<void> {
-    const { openaiApiKey, voice, systemPromptExtra } = this.plugin.settings;
+    const { voice, systemPromptExtra } = this.plugin.settings;
+    const apiKey = this.plugin.app.secretStorage.getSecret(OPENAI_SECRET_ID);
 
-    if (!openaiApiKey) {
+    if (!apiKey) {
       new Notice('Voice: no OpenAI API key configured. Open Settings to add one.');
       return;
     }
@@ -128,7 +129,7 @@ export class VoiceView extends ItemView {
     this.clearTranscript();
     this.connectBtn.disabled = true;
 
-    await this.session.connect(openaiApiKey, REALTIME_MODEL, voice, systemPrompt, {
+    await this.session.connect(apiKey, REALTIME_MODEL, voice, systemPrompt, {
       onStatusChange: (status) => {
         this.updateStatus(status);
         if (status === 'connected') {
