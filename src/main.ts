@@ -35,7 +35,10 @@ export default class VoicePlugin extends Plugin {
   }
 
   async onunload() {
-    this.app.workspace.detachLeavesOfType(VOICE_VIEW_TYPE);
+    // Intentionally not detaching leaves here so the panel persists
+    // across plugin reloads and BRAT updates. Obsidian serialises the
+    // workspace layout including this leaf; when the plugin reloads the
+    // view factory recreates VoiceView in the existing leaf automatically.
   }
 
   async activateView() {
