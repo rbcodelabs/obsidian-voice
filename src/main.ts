@@ -1,6 +1,6 @@
 import { Plugin, WorkspaceLeaf } from 'obsidian';
 import { VoiceView, VOICE_VIEW_TYPE } from './VoiceView';
-import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab } from './settings';
+import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab, OPENAI_SECRET_ID } from './settings';
 
 export default class VoicePlugin extends Plugin {
   settings!: VoiceSettings;
@@ -49,7 +49,16 @@ export default class VoicePlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData();
+
+    // One-time migration: move API key from data.json into SecretStorage.
+    if (data?.openaiApiKey) {
+      this.app.secretStorage.setSecret(OPENAI_SECRET_ID, data.openaiApiKey);
+      delete data.openaiApiKey;
+      await this.saveData(data);
+    }
+
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 
   async saveSettings() {
