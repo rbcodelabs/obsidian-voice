@@ -77,9 +77,10 @@ Follow these steps **in order**. Version files must be updated and committed **b
    git push origin master --tags
    ```
 
-5. **Create the GitHub release** with all three artifacts:
+5. **Create the GitHub release from the same directory where you built** — `dist/` in the main checkout is often stale from an older build:
    ```bash
-   gh release create vX.Y.Z main.js manifest.json styles.css \
+   # Run this from the worktree where npm run build was executed
+   gh release create vX.Y.Z dist/main.js dist/manifest.json dist/styles.css \
      --title "vX.Y.Z" \
      --notes "Brief description of changes"
    ```
@@ -90,4 +91,6 @@ Follow these steps **in order**. Version files must be updated and committed **b
    cat /tmp/check.json   # "version" must equal X.Y.Z
    ```
 
-> **Common mistake:** editing `manifest.json` *after* the build (or after `gh release create`) causes the old version to be uploaded as a release artifact even though the source file is correct. Always edit → build → commit → release.
+> **Common mistakes:**
+> - Editing `manifest.json` *after* the build causes the old version to be uploaded. Always edit → build → commit → release.
+> - Running `gh release create` from the main checkout (not the build worktree) uploads a stale `dist/` with an old version. Always run from the directory where `npm run build` was executed.
