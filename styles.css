@@ -15,12 +15,16 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 5px 8px 5px 10px;
   border-radius: 6px;
   background-color: var(--background-secondary);
   font-size: 0.85em;
   font-weight: 500;
   flex-shrink: 0;
+}
+
+.voice-status__text {
+  flex: 1;
 }
 
 .voice-status__dot {
@@ -57,16 +61,15 @@
 
 .voice-connect-btn {
   flex-shrink: 0;
-  padding: 8px 16px;
-  border-radius: 6px;
-  font-size: 0.9em;
+  padding: 4px 12px;
+  border-radius: 5px;
+  font-size: 0.82em;
   font-weight: 600;
   cursor: pointer;
   border: none;
   background-color: var(--interactive-accent);
   color: var(--text-on-accent);
   transition: opacity 0.15s ease;
-  width: 100%;
 }
 
 .voice-connect-btn:hover:not(:disabled) {

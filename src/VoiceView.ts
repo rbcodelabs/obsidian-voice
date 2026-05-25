@@ -56,13 +56,11 @@ export class VoiceView extends ItemView {
     root.empty();
     root.addClass('voice-panel');
 
-    // Status bar
+    // Status bar — dot + label + connect button on one row
     const statusBar = root.createDiv({ cls: 'voice-status' });
     this.statusDot = statusBar.createSpan({ cls: 'voice-status__dot' });
     this.statusText = statusBar.createSpan({ cls: 'voice-status__text', text: 'Idle' });
-
-    // Connect button
-    this.connectBtn = root.createEl('button', {
+    this.connectBtn = statusBar.createEl('button', {
       cls: 'voice-connect-btn',
       text: 'Connect',
     });
