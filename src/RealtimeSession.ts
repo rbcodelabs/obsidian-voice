@@ -1,5 +1,3 @@
-import { DOCUMENT_TOOLS } from './DocumentTools';
-
 export type SessionStatus = 'idle' | 'connecting' | 'connected' | 'error';
 
 export interface SessionCallbacks {
@@ -21,7 +19,8 @@ export class RealtimeSession {
     model: string,
     voice: string,
     systemPrompt: string,
-    callbacks: SessionCallbacks
+    callbacks: SessionCallbacks,
+    tools: unknown[] = []
   ): Promise<void> {
     callbacks.onStatusChange('connecting');
 
@@ -97,7 +96,7 @@ export class RealtimeSession {
         session: {
           type: 'realtime',
           instructions: systemPrompt,
-          tools: DOCUMENT_TOOLS,
+          tools,
           tool_choice: 'auto',
         },
       }));
