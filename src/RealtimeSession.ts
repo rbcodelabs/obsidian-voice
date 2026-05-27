@@ -8,11 +8,22 @@ export interface SessionCallbacks {
   getToolResult: (callId: string, name: string, argsJson: string) => Promise<string>;
 }
 
+interface PendingToolCall {
+  callId: string;
+  name: string;
+  argsJson: string;
+}
+
 export class RealtimeSession {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private audioEl: HTMLAudioElement | null = null;
   private micStream: MediaStream | null = null;
+  // Buffers tool calls arriving in a single response batch.
+  // Flushed (and executed) only when response.done fires, so we can send
+  // all outputs then a single response.create — avoiding the
+  // conversation_already_has_active_response error on parallel tool calls.
+  private pendingToolCalls: PendingToolCall[] = [];
 
   async connect(
     apiKey: string,
@@ -166,18 +177,16 @@ export class RealtimeSession {
       const callId = (event.call_id as string) ?? '';
       const name = (event.name as string) ?? '';
       const argsJson = (event.arguments as string) ?? '{}';
-      console.debug('[Voice] Tool call:', name, callId, argsJson);
+      console.debug('[Voice] Tool call buffered:', name, callId);
       callbacks.onToolCall(callId, name, argsJson);
-      callbacks.getToolResult(callId, name, argsJson)
-        .then((result) => {
-          console.debug('[Voice] Tool result:', name, result.slice(0, 200));
-          this.sendFunctionOutput(callId, result);
-        })
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error('[Voice] Tool error:', name, msg);
-          this.sendFunctionOutput(callId, `Error: ${msg}`);
-        });
+      this.pendingToolCalls.push({ callId, name, argsJson });
+    } else if (type === 'response.done') {
+      // Flush the batch: execute all buffered tool calls concurrently,
+      // send all outputs, then fire exactly one response.create.
+      if (this.pendingToolCalls.length > 0) {
+        const batch = this.pendingToolCalls.splice(0);
+        void this.flushToolBatch(batch, callbacks);
+      }
     } else if (type === 'error') {
       const errMsg = (event.message as string) ?? JSON.stringify(event);
       console.error('[Voice] Server error:', event);
@@ -185,18 +194,31 @@ export class RealtimeSession {
     }
   }
 
-  sendFunctionOutput(callId: string, output: string): void {
-    if (!this.dc || this.dc.readyState !== 'open') return;
-    console.debug('[Voice] Sending function output for', callId);
+  private async flushToolBatch(batch: PendingToolCall[], callbacks: SessionCallbacks): Promise<void> {
+    // Run all tools in the batch concurrently
+    const results = await Promise.all(
+      batch.map(async ({ callId, name, argsJson }) => {
+        try {
+          const result = await callbacks.getToolResult(callId, name, argsJson);
+          console.debug('[Voice] Tool result:', name, result.slice(0, 200));
+          return { callId, output: result };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[Voice] Tool error:', name, msg);
+          return { callId, output: `Error: ${msg}` };
+        }
+      })
+    );
 
-    this.dc.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'function_call_output',
-        call_id: callId,
-        output,
-      },
-    }));
+    if (!this.dc || this.dc.readyState !== 'open') return;
+
+    // Send all outputs first, then exactly one response.create
+    for (const { callId, output } of results) {
+      this.dc.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: { type: 'function_call_output', call_id: callId, output },
+      }));
+    }
     this.dc.send(JSON.stringify({ type: 'response.create' }));
   }
 
