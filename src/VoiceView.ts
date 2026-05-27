@@ -363,6 +363,10 @@ export class VoiceView extends ItemView {
           : 'Listing threads…';
       case 'ct_open_thread':
         return `Opening thread · ${String(args.thread_id ?? '').slice(0, 8)}…`;
+      case 'ct_close_thread':
+        return args.thread_id
+          ? `Closing thread · ${String(args.thread_id).slice(0, 8)}…`
+          : 'Closing active thread…';
       case 'ct_get_active_thread':
         return 'Reading active thread…';
       default:
@@ -428,6 +432,8 @@ export class VoiceView extends ItemView {
       }
       case 'ct_open_thread':
         return isError ? 'Open thread failed' : `Opened thread`;
+      case 'ct_close_thread':
+        return isError ? 'Close thread failed' : 'Thread closed';
       case 'ct_get_active_thread':
         return isError ? 'Read active thread failed' : 'Read active thread';
       default:

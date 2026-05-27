@@ -80,6 +80,23 @@ export const CLAUDE_THREADS_TOOLS = [
   },
   {
     type: 'function',
+    name: 'ct_close_thread',
+    description:
+      'Close (delete) a Claude thread. If the thread has messages and vault-save is enabled it will be archived first. ' +
+      'Cannot close the last remaining thread. Omit thread_id to close the currently active thread.',
+    parameters: {
+      type: 'object',
+      properties: {
+        thread_id: {
+          type: 'string',
+          description: 'ID of the thread to close. Omit to close the currently active thread.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    type: 'function',
     name: 'ct_get_active_thread',
     description: 'Get the thread currently visible in the Claude Threads panel, including its recent messages.',
     parameters: {
@@ -158,8 +175,25 @@ export async function executeClaudeThreadsTool(
       const threadId = String(args.thread_id);
       const manager = ct.manager as { getThread: (id: string) => Thread | undefined; sendMessage: (id: string, msg: string) => Promise<void> };
       if (!manager.getThread(threadId)) return `Error: thread "${threadId}" not found.`;
-      await manager.sendMessage(threadId, message);
-      return `Message sent to thread ${threadId}.`;
+
+      const activateView = (ct.activateView as () => Promise<void>).bind(ct);
+      const getView = (ct.getView as () => { focusThread: (id: string) => void } | null).bind(ct);
+
+      // Fire WITHOUT await. manager.sendMessage() pushes the user message to
+      // thread.messages synchronously before its first internal await (session.run),
+      // and emits streaming_start synchronously too. If we awaited it, we'd wait
+      // for Claude's entire response before opening the view — causing the user
+      // message to appear only after the response finishes.
+      void manager.sendMessage(threadId, message);
+
+      // Open the panel and focus the thread. By the time focusThread() calls
+      // renderMessages(), the user message is already in thread.messages and the
+      // streaming buffer is accumulating — so the view renders correctly mid-stream.
+      await activateView();
+      await new Promise((r) => setTimeout(r, 150));
+      getView()?.focusThread(threadId);
+
+      return `Message sent to thread ${threadId}. The thread is now open in the Claude Threads panel.`;
     } else {
       const dispatchNewThread = ct.dispatchNewThread as (text: string, images?: unknown, titleHint?: string) => Promise<string>;
       const threadId = await dispatchNewThread(message, undefined, args.title_hint ? String(args.title_hint) : undefined);
@@ -219,9 +253,47 @@ export async function executeClaudeThreadsTool(
   if (name === 'ct_open_thread') {
     const threadId = String(args.thread_id ?? '').trim();
     if (!threadId) return 'Error: thread_id is required.';
-    const openThreadInChatView = ct.openThreadInChatView as (id: string) => Promise<void>;
-    await openThreadInChatView(threadId);
+
+    // openThreadInChatView calls activateView() then immediately focusThread(),
+    // but if the panel wasn't already open the view's DOM (titleEl) hasn't mounted
+    // yet and setActiveThread bails out early. Fix: activate first, wait a frame
+    // for Obsidian to finish mounting, then focus the thread ourselves.
+    const activateView = (ct.activateView as () => Promise<void>).bind(ct);
+    const getView = (ct.getView as () => { focusThread: (id: string) => void } | null).bind(ct);
+
+    await activateView();
+    await new Promise((r) => setTimeout(r, 150));
+    const view = getView();
+    if (!view) return `Error: Claude Threads chat view could not be opened.`;
+    view.focusThread(threadId);
     return `Opened thread ${threadId} in the Claude Threads panel.`;
+  }
+
+  // ── ct_close_thread ────────────────────────────────────────────────────────
+  if (name === 'ct_close_thread') {
+    const getActiveThreadId = ct.getActiveThreadId as () => string | null;
+    const getView = (ct.getView as () => { closeThread: (id: string) => void; getActiveThreadId: () => string | null } | null).bind(ct);
+    const manager = ct.manager as { getThread: (id: string) => Thread | undefined; getThreads: () => Thread[] };
+
+    const id = args.thread_id ? String(args.thread_id) : getActiveThreadId();
+    if (!id) return 'Error: no thread_id provided and no active thread.';
+    if (!manager.getThread(id)) return `Error: thread "${id}" not found.`;
+
+    const allThreads = manager.getThreads();
+    if (allThreads.length <= 1) return 'Cannot close the last remaining thread.';
+
+    const view = getView();
+    if (!view) {
+      // Panel not open — delete directly via manager
+      const del = (ct.manager as { deleteThread: (id: string) => void }).deleteThread.bind(ct.manager);
+      del(id);
+      const saveSettings = (ct.saveSettings as () => Promise<void>).bind(ct);
+      await saveSettings();
+      return `Thread ${id} closed.`;
+    }
+
+    view.closeThread(id);
+    return `Thread ${id} closed.`;
   }
 
   // ── ct_get_active_thread ───────────────────────────────────────────────────
