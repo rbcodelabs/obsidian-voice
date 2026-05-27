@@ -1,7 +1,8 @@
 import { ItemView, MarkdownView, Notice, WorkspaceLeaf } from 'obsidian';
 import type VoicePlugin from './main';
 import { RealtimeSession, SessionStatus } from './RealtimeSession';
-import { executeToolCall } from './DocumentTools';
+import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
+import { CLAUDE_THREADS_TOOLS, CLAUDE_THREADS_TOOL_NAMES, executeClaudeThreadsTool } from './ClaudeThreadsTools';
 import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
@@ -121,7 +122,13 @@ export class VoiceView extends ItemView {
 
     const view = this.getMarkdownView();
     const docContent = this.getCurrentDocContent();
-    const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra);
+    const claudeThreadsAvailable = this.isClaudeThreadsAvailable();
+    const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra, claudeThreadsAvailable);
+
+    // Merge document tools with Claude Threads tools (when the plugin is present)
+    const allTools = claudeThreadsAvailable
+      ? [...DOCUMENT_TOOLS, ...CLAUDE_THREADS_TOOLS]
+      : DOCUMENT_TOOLS;
 
     this.session = new RealtimeSession();
     this.clearTranscript();
@@ -167,7 +174,9 @@ export class VoiceView extends ItemView {
         } catch {
           return `Error: could not parse tool arguments`;
         }
-        const result = await executeToolCall(name, args, this.app, this.lastMarkdownView);
+        const result = CLAUDE_THREADS_TOOL_NAMES.has(name)
+          ? await executeClaudeThreadsTool(name, args, this.app)
+          : await executeToolCall(name, args, this.app, this.lastMarkdownView);
         // Update the pill with outcome
         const el = this.pendingToolEls.get(callId);
         if (el) {
@@ -176,7 +185,7 @@ export class VoiceView extends ItemView {
         }
         return result;
       },
-    });
+    }, allTools);
   }
 
   private doDisconnect(): void {
@@ -195,6 +204,12 @@ export class VoiceView extends ItemView {
     const view = this.getMarkdownView();
     if (!view) return '(no document currently open)';
     return view.editor.getValue();
+  }
+
+  private isClaudeThreadsAvailable(): boolean {
+    // app.plugins is an internal Obsidian API not in the TypeScript types.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return !!((this.app as any)?.plugins?.plugins?.['claude-threads']);
   }
 
   private updateContextBanner(): void {
@@ -216,7 +231,7 @@ export class VoiceView extends ItemView {
     }
   }
 
-  private buildSystemPrompt(docContent: string, extra: string): string {
+  private buildSystemPrompt(docContent: string, extra: string, hasClaudeThreads = false): string {
     let prompt =
       'You are a voice assistant helping with an Obsidian document. ' +
       'The current document content is:\n\n```\n' +
@@ -224,6 +239,12 @@ export class VoiceView extends ItemView {
       '\n```\n\n' +
       'You can read it, answer questions about it, and use the available tools to edit it. ' +
       'Keep responses concise: this is a voice conversation.';
+    if (hasClaudeThreads) {
+      prompt +=
+        '\n\nYou also have access to Claude Threads tools (ct_* prefix). ' +
+        'Use them to dispatch tasks to background Claude agents, check agent status, read thread history, and open threads in the UI. ' +
+        'When sending a message with ct_send_message, remind the user that the agent runs asynchronously and they can ask you to check its status later.';
+    }
     if (extra.trim()) {
       prompt += '\n\n' + extra.trim();
     }
@@ -329,6 +350,21 @@ export class VoiceView extends ItemView {
         return `Creating document · ${args.path as string ?? ''}…`;
       case 'list_folder':
         return `Listing folder · ${args.path as string || '/'}…`;
+      // Claude Threads tools
+      case 'ct_send_message':
+        return args.thread_id
+          ? `Sending to thread…`
+          : `Dispatching agent · "${String(args.message ?? '').slice(0, 40)}"…`;
+      case 'ct_get_thread':
+        return `Reading thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}…`;
+      case 'ct_list_threads':
+        return args.status && args.status !== 'all'
+          ? `Listing ${String(args.status)} threads…`
+          : 'Listing threads…';
+      case 'ct_open_thread':
+        return `Opening thread · ${String(args.thread_id ?? '').slice(0, 8)}…`;
+      case 'ct_get_active_thread':
+        return 'Reading active thread…';
       default:
         return `${name}…`;
     }
@@ -373,6 +409,27 @@ export class VoiceView extends ItemView {
         const count = (result.match(/\n  /g) ?? []).length;
         return `Listed · ${args.path as string || '/'} · ${count} item${count !== 1 ? 's' : ''}`;
       }
+      // Claude Threads tools
+      case 'ct_send_message': {
+        if (isError) return `Dispatch failed`;
+        return args.thread_id
+          ? `Sent message to thread`
+          : `Agent dispatched`;
+      }
+      case 'ct_get_thread': {
+        if (isError) return `Read thread failed`;
+        return `Read thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}`;
+      }
+      case 'ct_list_threads': {
+        if (isError) return 'List threads failed';
+        const countMatch = result.match(/"count":\s*(\d+)/);
+        const n = countMatch ? countMatch[1] : '?';
+        return `Listed ${n} thread${n !== '1' ? 's' : ''}`;
+      }
+      case 'ct_open_thread':
+        return isError ? 'Open thread failed' : `Opened thread`;
+      case 'ct_get_active_thread':
+        return isError ? 'Read active thread failed' : 'Read active thread';
       default:
         return isError ? `${name} failed` : name;
     }
