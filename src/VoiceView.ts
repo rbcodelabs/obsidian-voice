@@ -7,6 +7,28 @@ import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
+const VOICE_CONTROL_TOOLS = [
+  {
+    type: 'function',
+    name: 'voice_disconnect',
+    description: 'Disconnect the voice session. Use when the user says goodbye, asks to stop, or wants to end the conversation.',
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    type: 'function',
+    name: 'voice_wait',
+    description: 'Pause for a specified number of seconds before responding. Useful when waiting for something to happen.',
+    parameters: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'number', description: 'How many seconds to wait (1–300).' },
+        reason: { type: 'string', description: 'Optional reason for waiting, shown in the transcript.' },
+      },
+      required: ['seconds'],
+    },
+  },
+];
+
 interface TranscriptEntry {
   role: 'user' | 'assistant' | 'tool';
   text: string;
@@ -125,10 +147,10 @@ export class VoiceView extends ItemView {
     const claudeThreadsAvailable = this.isClaudeThreadsAvailable();
     const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra, claudeThreadsAvailable);
 
-    // Merge document tools with Claude Threads tools (when the plugin is present)
+    // Merge document tools, Claude Threads tools (when available), and voice control tools
     const allTools = claudeThreadsAvailable
-      ? [...DOCUMENT_TOOLS, ...CLAUDE_THREADS_TOOLS]
-      : DOCUMENT_TOOLS;
+      ? [...DOCUMENT_TOOLS, ...CLAUDE_THREADS_TOOLS, ...VOICE_CONTROL_TOOLS]
+      : [...DOCUMENT_TOOLS, ...VOICE_CONTROL_TOOLS];
 
     this.session = new RealtimeSession();
     this.clearTranscript();
@@ -174,9 +196,19 @@ export class VoiceView extends ItemView {
         } catch {
           return `Error: could not parse tool arguments`;
         }
-        const result = CLAUDE_THREADS_TOOL_NAMES.has(name)
-          ? await executeClaudeThreadsTool(name, args, this.app)
-          : await executeToolCall(name, args, this.app, this.lastMarkdownView);
+        let result: string;
+        if (name === 'voice_disconnect') {
+          result = 'Disconnecting voice session.';
+          setTimeout(() => this.doDisconnect(), 3000);
+        } else if (name === 'voice_wait') {
+          const secs = Math.min(Math.max(1, Number(args.seconds) || 5), 300);
+          await new Promise((r) => setTimeout(r, secs * 1000));
+          result = `Waited ${secs} second${secs !== 1 ? 's' : ''}.${args.reason ? ' ' + String(args.reason) : ''}`;
+        } else if (CLAUDE_THREADS_TOOL_NAMES.has(name)) {
+          result = await executeClaudeThreadsTool(name, args, this.app);
+        } else {
+          result = await executeToolCall(name, args, this.app, this.lastMarkdownView);
+        }
         // Update the pill with outcome
         const el = this.pendingToolEls.get(callId);
         if (el) {
@@ -242,8 +274,9 @@ export class VoiceView extends ItemView {
     if (hasClaudeThreads) {
       prompt +=
         '\n\nYou also have access to Claude Threads tools (ct_* prefix). ' +
-        'Use them to dispatch tasks to background Claude agents, check agent status, read thread history, and open threads in the UI. ' +
-        'When sending a message with ct_send_message, remind the user that the agent runs asynchronously and they can ask you to check its status later.';
+        'Use ct_new_thread to start a fresh conversation and ct_send_message to reply in an existing thread. ' +
+        'IMPORTANT: ct_new_thread and ct_send_message both have a wait parameter that defaults to true — always leave it as true unless the user explicitly asks to run something in the background. ' +
+        'When wait=true the tool blocks until the agent finishes and returns its response directly, so you can report back immediately without any extra steps.';
     }
     if (extra.trim()) {
       prompt += '\n\n' + extra.trim();
@@ -352,9 +385,11 @@ export class VoiceView extends ItemView {
         return `Listing folder · ${args.path as string || '/'}…`;
       // Claude Threads tools
       case 'ct_send_message':
-        return args.thread_id
-          ? `Sending to thread…`
-          : `Dispatching agent · "${String(args.message ?? '').slice(0, 40)}"…`;
+        return `Sending to thread · "${String(args.message ?? '').slice(0, 40)}"…`;
+      case 'ct_new_thread':
+        return `Starting new thread · "${String(args.message ?? '').slice(0, 40)}"…`;
+      case 'ct_wait_for_thread':
+        return `Waiting for thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}…`;
       case 'ct_get_thread':
         return `Reading thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}…`;
       case 'ct_list_threads':
@@ -369,6 +404,10 @@ export class VoiceView extends ItemView {
           : 'Closing active thread…';
       case 'ct_get_active_thread':
         return 'Reading active thread…';
+      case 'voice_disconnect':
+        return 'Disconnecting…';
+      case 'voice_wait':
+        return `Waiting ${Number(args.seconds) || 5}s…`;
       default:
         return `${name}…`;
     }
@@ -414,12 +453,12 @@ export class VoiceView extends ItemView {
         return `Listed · ${args.path as string || '/'} · ${count} item${count !== 1 ? 's' : ''}`;
       }
       // Claude Threads tools
-      case 'ct_send_message': {
-        if (isError) return `Dispatch failed`;
-        return args.thread_id
-          ? `Sent message to thread`
-          : `Agent dispatched`;
-      }
+      case 'ct_send_message':
+        return isError ? 'Send failed' : 'Sent · agent replied';
+      case 'ct_new_thread':
+        return isError ? 'New thread failed' : 'New thread · agent replied';
+      case 'ct_wait_for_thread':
+        return isError ? 'Wait failed' : 'Thread finished';
       case 'ct_get_thread': {
         if (isError) return `Read thread failed`;
         return `Read thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}`;
@@ -431,11 +470,15 @@ export class VoiceView extends ItemView {
         return `Listed ${n} thread${n !== '1' ? 's' : ''}`;
       }
       case 'ct_open_thread':
-        return isError ? 'Open thread failed' : `Opened thread`;
+        return isError ? 'Open thread failed' : 'Opened thread';
       case 'ct_close_thread':
         return isError ? 'Close thread failed' : 'Thread closed';
       case 'ct_get_active_thread':
         return isError ? 'Read active thread failed' : 'Read active thread';
+      case 'voice_disconnect':
+        return 'Disconnecting…';
+      case 'voice_wait':
+        return result;
       default:
         return isError ? `${name} failed` : name;
     }
