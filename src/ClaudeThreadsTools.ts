@@ -49,14 +49,17 @@ export const CLAUDE_THREADS_TOOLS = [
     name: 'ct_list_threads',
     description:
       'List Claude threads and their statuses. ' +
-      'Use status="active" to see agents currently running, "waiting" to see idle threads, or "all" for everything.',
+      'Use status="active" to see agents currently running, "waiting_new" to see threads with unread results, ' +
+      '"waiting" to see all idle threads (read and unread), "error" for failed threads, or "all" for everything.',
     parameters: {
       type: 'object',
       properties: {
         status: {
           type: 'string',
-          enum: ['active', 'waiting', 'error', 'all'],
-          description: 'Filter by status. Default is "all".',
+          enum: ['active', 'waiting', 'waiting_new', 'error', 'all'],
+          description:
+            'Filter by status. "waiting_new" = finished but not yet reviewed. ' +
+            '"waiting" = all idle threads. Default is "all".',
         },
         limit: {
           type: 'number',
@@ -131,6 +134,7 @@ interface Thread {
   id: string;
   title: string;
   status?: string;
+  reviewed?: boolean;
   messages?: Array<{ role: string; content: string; timestamp?: number }>;
   createdAt: number;
   updatedAt: number;
@@ -138,12 +142,21 @@ interface Thread {
   cwd?: string;
 }
 
+/** Returns a fine-grained status string that distinguishes waiting_new from waiting. */
+function computeFullStatus(t: Thread): string {
+  const base = t.status ?? 'waiting';
+  if (base === 'waiting' && (t.messages?.length ?? 0) > 0) {
+    return t.reviewed ? 'waiting' : 'waiting_new';
+  }
+  return base;
+}
+
 function threadSummary(t: Thread, lastN?: number): Record<string, unknown> {
   const msgs = (t.messages ?? []).slice(-(Math.min(lastN ?? 5, 20)));
   return {
     id: t.id,
     title: t.title,
-    status: t.status ?? 'waiting',
+    status: computeFullStatus(t),
     cwd: t.cwd,
     messageCount: t.messages?.length ?? 0,
     updatedAt: t.updatedAt,
@@ -223,7 +236,9 @@ export async function executeClaudeThreadsTool(
     const filtered =
       statusFilter === 'all'
         ? allThreads
-        : allThreads.filter((t) => (t.status ?? 'waiting') === statusFilter);
+        : statusFilter === 'waiting'
+          ? allThreads.filter((t) => (t.status ?? 'waiting') === 'waiting')
+          : allThreads.filter((t) => computeFullStatus(t) === statusFilter);
 
     const sorted = filtered
       .slice()
@@ -239,7 +254,7 @@ export async function executeClaudeThreadsTool(
     const summaries = sorted.map((t) => ({
       id: t.id,
       title: t.title,
-      status: t.status ?? 'waiting',
+      status: computeFullStatus(t),
       messageCount: t.messages?.length ?? 0,
       lastMessage: t.messages?.at(-1)?.content?.toString().slice(0, 120),
       updatedAt: new Date(t.updatedAt).toISOString(),
