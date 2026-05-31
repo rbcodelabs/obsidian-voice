@@ -21,9 +21,16 @@ export class RealtimeSession {
   private micStream: MediaStream | null = null;
   // Buffers tool calls arriving in a single response batch.
   // Flushed (and executed) only when response.done fires, so we can send
-  // all outputs then a single response.create — avoiding the
+  // all outputs then a single response.create -- avoiding the
   // conversation_already_has_active_response error on parallel tool calls.
   private pendingToolCalls: PendingToolCall[] = [];
+  // Tracks whether the server currently has an active response in flight.
+  // Set on response.created, cleared on response.done.
+  private isResponseActive = false;
+  // Resolvers waiting for the current response to finish (used when
+  // flushToolBatch needs to cancel an in-flight VAD response before
+  // submitting tool outputs).
+  private responseDoneResolvers: Array<() => void> = [];
 
   async connect(
     apiKey: string,
@@ -165,7 +172,9 @@ export class RealtimeSession {
   private handleEvent(event: Record<string, unknown>, callbacks: SessionCallbacks): void {
     const type = event.type as string;
 
-    if (type === 'response.audio_transcript.delta') {
+    if (type === 'response.created') {
+      this.isResponseActive = true;
+    } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
     } else if (type === 'response.audio_transcript.done') {
@@ -181,6 +190,10 @@ export class RealtimeSession {
       callbacks.onToolCall(callId, name, argsJson);
       this.pendingToolCalls.push({ callId, name, argsJson });
     } else if (type === 'response.done') {
+      this.isResponseActive = false;
+      // Unblock any flushToolBatch that was waiting for cancel to settle.
+      const resolvers = this.responseDoneResolvers.splice(0);
+      for (const resolve of resolvers) resolve();
       // Flush the batch: execute all buffered tool calls concurrently,
       // send all outputs, then fire exactly one response.create.
       if (this.pendingToolCalls.length > 0) {
@@ -188,14 +201,18 @@ export class RealtimeSession {
         void this.flushToolBatch(batch, callbacks);
       }
     } else if (type === 'error') {
-      const errMsg = (event.message as string) ?? JSON.stringify(event);
+      // The Realtime API nests the error details under event.error.
+      const errorObj = event.error as Record<string, unknown> | undefined;
+      const errMsg = (errorObj?.message as string) ?? (event.message as string) ?? JSON.stringify(event);
       console.error('[Voice] Server error:', event);
       callbacks.onError(`Server error: ${errMsg}`);
     }
   }
 
   private async flushToolBatch(batch: PendingToolCall[], callbacks: SessionCallbacks): Promise<void> {
-    // Run all tools in the batch concurrently
+    // Run all tools in the batch concurrently. These can take 30-120s for
+    // slow tools (e.g. ct_new_thread / ct_send_message), during which VAD
+    // may fire and start a new response.
     const results = await Promise.all(
       batch.map(async ({ callId, name, argsJson }) => {
         try {
@@ -211,6 +228,17 @@ export class RealtimeSession {
     );
 
     if (!this.dc || this.dc.readyState !== 'open') return;
+
+    // If VAD started a new response while tools were running, cancel it
+    // before submitting outputs -- otherwise we get
+    // conversation_already_has_active_response.
+    if (this.isResponseActive) {
+      console.debug('[Voice] Active response detected; sending response.cancel before tool outputs');
+      this.dc.send(JSON.stringify({ type: 'response.cancel' }));
+      // Wait for the server to acknowledge the cancel via response.done.
+      await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
+      if (!this.dc || this.dc.readyState !== 'open') return;
+    }
 
     // Send all outputs first, then exactly one response.create
     for (const { callId, output } of results) {
