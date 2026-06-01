@@ -35,6 +35,7 @@ export class RealtimeSession {
   private currentResponseContext: { type: 'user' } | { type: 'notification'; threadId: string } | null = null;
   private pendingNotificationContext: { threadId: string } | null = null;
   private notificationCancelPending = false;
+  private pendingResponseRetry = false;
   private callbacks: SessionCallbacks | null = null;
 
   async connect(
@@ -226,10 +227,28 @@ export class RealtimeSession {
         const next = this.notificationQueue.shift();
         if (next) void this.sendNotification(next);
       }
+
+      // Retry a response.create that was rejected due to an active-response race.
+      // The conversation item already landed; just nudge the server to respond to it.
+      if (this.pendingResponseRetry && !this.isResponseActive && this.notificationQueue.length === 0) {
+        this.pendingResponseRetry = false;
+        if (this.dc && this.dc.readyState === 'open') {
+          this.dc.send(JSON.stringify({ type: 'response.create' }));
+        }
+      }
     } else if (type === 'error') {
-      // The Realtime API nests the error details under event.error.
       const errorObj = event.error as Record<string, unknown> | undefined;
       const errMsg = (errorObj?.message as string) ?? (event.message as string) ?? JSON.stringify(event);
+      const errCode = (errorObj?.code as string) ?? '';
+
+      // "conversation already has active response" is a timing race we can recover from:
+      // our conversation.item.create already landed, so just retry response.create on next response.done.
+      if (errCode === 'conversation_already_has_active_response' || errMsg.includes('already has an active response')) {
+        console.warn('[Voice] Active-response race detected — will retry response.create after current response finishes');
+        this.pendingResponseRetry = true;
+        return;
+      }
+
       console.error('[Voice] Server error:', event);
       callbacks.onError(`Server error: ${errMsg}`);
     }
@@ -349,5 +368,6 @@ export class RealtimeSession {
     this.currentResponseContext = null;
     this.pendingNotificationContext = null;
     this.notificationCancelPending = false;
+    this.pendingResponseRetry = false;
   }
 }
