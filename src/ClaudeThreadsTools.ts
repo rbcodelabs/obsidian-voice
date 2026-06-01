@@ -19,6 +19,12 @@ export const CLAUDE_THREADS_TOOLS = [
           type: 'boolean',
           description: 'If true (default), block until the agent finishes and return its response. Set false to send without waiting.',
         },
+        watch: {
+          type: 'boolean',
+          description:
+            'When wait=false, automatically subscribe to live notifications for this thread (default true). ' +
+            'Set false only if you do not want to be notified when it finishes.',
+        },
         timeout_secs: {
           type: 'number',
           description: 'Seconds to wait before timing out (default 120, max 300).',
@@ -42,6 +48,12 @@ export const CLAUDE_THREADS_TOOLS = [
         wait: {
           type: 'boolean',
           description: 'If true (default), block until the agent finishes and return its response. Set false to send without waiting.',
+        },
+        watch: {
+          type: 'boolean',
+          description:
+            'When wait=false, automatically subscribe to live notifications for this thread (default true). ' +
+            'Set false only if you do not want to be notified when it finishes.',
         },
         timeout_secs: {
           type: 'number',
@@ -153,6 +165,41 @@ export const CLAUDE_THREADS_TOOLS = [
         last_n: {
           type: 'number',
           description: 'How many recent messages to return (default 5).',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    type: 'function',
+    name: 'ct_watch',
+    description:
+      'Subscribe to live notifications for a Claude thread. ' +
+      'When the thread finishes, errors, or sends a new message, you will be notified automatically. ' +
+      'Use after launching a thread with wait=false. Omit thread_id to watch ALL currently running threads.',
+    parameters: {
+      type: 'object',
+      properties: {
+        thread_id: {
+          type: 'string',
+          description: 'Thread ID to watch. Omit to watch all current threads.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    type: 'function',
+    name: 'ct_unwatch',
+    description:
+      'Stop receiving notifications for a thread (or all threads). ' +
+      'Use when you no longer need updates from a thread.',
+    parameters: {
+      type: 'object',
+      properties: {
+        thread_id: {
+          type: 'string',
+          description: 'Thread ID to stop watching. Omit to stop watching all threads.',
         },
       },
       required: [],
@@ -274,7 +321,8 @@ function waitForThread(manager: SubscribableManager, threadId: string, timeoutSe
 export async function executeClaudeThreadsTool(
   name: string,
   args: Record<string, unknown>,
-  app: App
+  app: App,
+  bridge?: import('./NotificationBridge').NotificationBridge | null
 ): Promise<string> {
   const ct = getPlugin(app);
   if (!ct) {
@@ -306,6 +354,9 @@ export async function executeClaudeThreadsTool(
     getView()?.focusThread(threadId);
 
     if (!wait) {
+      if (bridge && args.watch !== false) {
+        bridge.watch(threadId);
+      }
       return `Message sent to thread ${threadId}. Running in the background.`;
     }
     return waitForThread(manager, threadId, timeoutSecs);
@@ -330,6 +381,9 @@ export async function executeClaudeThreadsTool(
     getView()?.focusThread(threadId);
 
     if (!wait) {
+      if (bridge && args.watch !== false) {
+        bridge.watch(threadId);
+      }
       return `New thread started (id: ${threadId}). Running in the background.`;
     }
     return waitForThread(manager, threadId, timeoutSecs);
@@ -447,6 +501,31 @@ export async function executeClaudeThreadsTool(
     if (!thread) return `Active thread ID "${id}" not found in manager.`;
     const lastN = args.last_n ? Math.min(Number(args.last_n), 20) : 5;
     return JSON.stringify(threadSummary(thread, lastN), null, 2);
+  }
+
+  // ── ct_watch ─────────────────────────────────────────────────────────────
+  if (name === 'ct_watch') {
+    if (!bridge) return 'Error: notification bridge not available in this session.';
+    const threadId = args.thread_id ? String(args.thread_id).trim() : null;
+    if (threadId) {
+      if (!manager.getThread(threadId)) return `Error: thread "${threadId}" not found.`;
+      bridge.watch(threadId);
+      return `Now watching thread ${threadId} for live notifications.`;
+    } else {
+      bridge.watchAll();
+      const count = manager.getThreads().length;
+      return `Now watching all ${count} thread${count !== 1 ? 's' : ''} for live notifications.`;
+    }
+  }
+
+  // ── ct_unwatch ────────────────────────────────────────────────────────────
+  if (name === 'ct_unwatch') {
+    if (!bridge) return 'Error: notification bridge not available in this session.';
+    const threadId = args.thread_id ? String(args.thread_id).trim() : undefined;
+    bridge.unwatch(threadId);
+    return threadId
+      ? `Stopped watching thread ${threadId}.`
+      : 'Stopped watching all threads — notifications paused.';
   }
 
   return `Error: unknown Claude Threads tool "${name}"`;
