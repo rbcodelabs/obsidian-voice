@@ -224,7 +224,7 @@ export class RealtimeSession {
       if (this.notificationCancelPending || this.notificationQueue.length > 0) {
         this.notificationCancelPending = false;
         const next = this.notificationQueue.shift();
-        if (next) this.sendNotification(next);
+        if (next) void this.sendNotification(next);
       }
     } else if (type === 'error') {
       // The Realtime API nests the error details under event.error.
@@ -282,7 +282,7 @@ export class RealtimeSession {
     const item = { threadId, text };
 
     if (!this.isResponseActive) {
-      this.sendNotification(item);
+      void this.sendNotification(item);
       return;
     }
 
@@ -300,8 +300,16 @@ export class RealtimeSession {
     }
   }
 
-  private sendNotification(item: { threadId: string; text: string }): void {
+  private async sendNotification(item: { threadId: string; text: string }): Promise<void> {
     if (!this.dc || this.dc.readyState !== 'open') return;
+
+    // If a response is active, cancel it first (same guard as flushToolBatch)
+    if (this.isResponseActive) {
+      this.dc.send(JSON.stringify({ type: 'response.cancel' }));
+      await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
+      if (!this.dc || this.dc.readyState !== 'open') return;
+    }
+
     this.pendingNotificationContext = { threadId: item.threadId };
     this.dc.send(JSON.stringify({
       type: 'conversation.item.create',
