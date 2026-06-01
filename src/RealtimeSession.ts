@@ -31,6 +31,11 @@ export class RealtimeSession {
   // flushToolBatch needs to cancel an in-flight VAD response before
   // submitting tool outputs).
   private responseDoneResolvers: Array<() => void> = [];
+  private notificationQueue: Array<{ threadId: string; text: string }> = [];
+  private currentResponseContext: { type: 'user' } | { type: 'notification'; threadId: string } | null = null;
+  private pendingNotificationContext: { threadId: string } | null = null;
+  private notificationCancelPending = false;
+  private callbacks: SessionCallbacks | null = null;
 
   async connect(
     apiKey: string,
@@ -41,6 +46,7 @@ export class RealtimeSession {
     tools: unknown[] = []
   ): Promise<void> {
     callbacks.onStatusChange('connecting');
+    this.callbacks = callbacks;
 
     // Step 1: fetch ephemeral token — set model, voice, and instructions at creation time
     let ephemeralToken: string;
@@ -174,6 +180,12 @@ export class RealtimeSession {
 
     if (type === 'response.created') {
       this.isResponseActive = true;
+      if (this.pendingNotificationContext) {
+        this.currentResponseContext = { type: 'notification', threadId: this.pendingNotificationContext.threadId };
+        this.pendingNotificationContext = null;
+      } else {
+        this.currentResponseContext = { type: 'user' };
+      }
     } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
@@ -191,14 +203,28 @@ export class RealtimeSession {
       this.pendingToolCalls.push({ callId, name, argsJson });
     } else if (type === 'response.done') {
       this.isResponseActive = false;
-      // Unblock any flushToolBatch that was waiting for cancel to settle.
+      this.currentResponseContext = null;
+
       const resolvers = this.responseDoneResolvers.splice(0);
       for (const resolve of resolvers) resolve();
-      // Flush the batch: execute all buffered tool calls concurrently,
-      // send all outputs, then fire exactly one response.create.
+
+      // If this done was triggered by a flushToolBatch cancel-wait, don't
+      // touch the notification queue — flushToolBatch will send response.create
+      // and the next response.done will drain it.
+      if (resolvers.length > 0) return;
+
+      // Tool batch takes priority over notifications
       if (this.pendingToolCalls.length > 0) {
         const batch = this.pendingToolCalls.splice(0);
-        void this.flushToolBatch(batch, callbacks);
+        void this.flushToolBatch(batch, this.callbacks!);
+        return;
+      }
+
+      // Drain notification queue
+      if (this.notificationCancelPending || this.notificationQueue.length > 0) {
+        this.notificationCancelPending = false;
+        const next = this.notificationQueue.shift();
+        if (next) this.sendNotification(next);
       }
     } else if (type === 'error') {
       // The Realtime API nests the error details under event.error.
@@ -250,6 +276,44 @@ export class RealtimeSession {
     this.dc.send(JSON.stringify({ type: 'response.create' }));
   }
 
+  injectNotification(threadId: string, text: string): void {
+    if (!this.dc || this.dc.readyState !== 'open') return;
+
+    const item = { threadId, text };
+
+    if (!this.isResponseActive) {
+      this.sendNotification(item);
+      return;
+    }
+
+    if (
+      this.currentResponseContext?.type === 'notification' &&
+      this.currentResponseContext.threadId === threadId
+    ) {
+      // Same thread being discussed — cancel and re-queue
+      this.notificationQueue.push(item);
+      this.notificationCancelPending = true;
+      this.dc.send(JSON.stringify({ type: 'response.cancel' }));
+    } else {
+      // Different context — queue for later
+      this.notificationQueue.push(item);
+    }
+  }
+
+  private sendNotification(item: { threadId: string; text: string }): void {
+    if (!this.dc || this.dc.readyState !== 'open') return;
+    this.pendingNotificationContext = { threadId: item.threadId };
+    this.dc.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: item.text }],
+      },
+    }));
+    this.dc.send(JSON.stringify({ type: 'response.create' }));
+  }
+
   disconnect(): void {
     this.cleanup();
   }
@@ -272,5 +336,10 @@ export class RealtimeSession {
       this.pc.close();
       this.pc = null;
     }
+    this.callbacks = null;
+    this.notificationQueue = [];
+    this.currentResponseContext = null;
+    this.pendingNotificationContext = null;
+    this.notificationCancelPending = false;
   }
 }
