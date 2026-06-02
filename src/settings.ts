@@ -15,12 +15,14 @@ export interface VoiceSettings {
   voice: RealtimeVoice;
   systemPromptExtra: string;
   autoApplyEdits: boolean;
+  debugLogging: boolean;
 }
 
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   voice: 'marin',
   systemPromptExtra: '',
   autoApplyEdits: true,
+  debugLogging: false,
 };
 
 export class VoiceSettingTab extends PluginSettingTab {
@@ -88,6 +90,20 @@ export class VoiceSettingTab extends PluginSettingTab {
           });
         text.inputEl.rows = 4;
         text.inputEl.style.width = '100%';
+      });
+
+    containerEl.createEl('h2', { text: 'Developer' });
+
+    new Setting(containerEl)
+      .setName('Debug logging')
+      .setDesc('Log detailed [Voice] events to the DevTools console (Cmd+Option+I). Useful for diagnosing notification bridge issues. Disable when not needed.')
+      .addToggle(toggle => {
+        toggle
+          .setValue(this.plugin.settings.debugLogging)
+          .onChange(async (value) => {
+            this.plugin.settings.debugLogging = value;
+            await this.plugin.saveSettings();
+          });
       });
   }
 }

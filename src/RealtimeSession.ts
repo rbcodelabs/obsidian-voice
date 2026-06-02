@@ -37,6 +37,7 @@ export class RealtimeSession {
   private notificationCancelPending = false;
   private pendingResponseRetry = false;
   private callbacks: SessionCallbacks | null = null;
+  private debug = false;
 
   async connect(
     apiKey: string,
@@ -44,10 +45,12 @@ export class RealtimeSession {
     voice: string,
     systemPrompt: string,
     callbacks: SessionCallbacks,
-    tools: unknown[] = []
+    tools: unknown[] = [],
+    debug = false
   ): Promise<void> {
     callbacks.onStatusChange('connecting');
     this.callbacks = callbacks;
+    this.debug = debug;
 
     // Step 1: fetch ephemeral token — set model, voice, and instructions at creation time
     let ephemeralToken: string;
@@ -187,7 +190,7 @@ export class RealtimeSession {
       } else {
         this.currentResponseContext = { type: 'user' };
       }
-      console.debug(`[Voice] response.created — ctx now: ${JSON.stringify(this.currentResponseContext)}`);
+      if (this.debug) console.debug(`[Voice] response.created — ctx now: ${JSON.stringify(this.currentResponseContext)}`);
     } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
@@ -210,13 +213,13 @@ export class RealtimeSession {
       const resolvers = this.responseDoneResolvers.splice(0);
       for (const resolve of resolvers) resolve();
 
-      console.log(`[Voice] response.done: resolvers=${resolvers.length} pendingTools=${this.pendingToolCalls.length} notifQueue=${this.notificationQueue.length} notifCancelPending=${this.notificationCancelPending} pendingRetry=${this.pendingResponseRetry}`);
+      if (this.debug) console.debug(`[Voice] response.done: resolvers=${resolvers.length} pendingTools=${this.pendingToolCalls.length} notifQueue=${this.notificationQueue.length} notifCancelPending=${this.notificationCancelPending} pendingRetry=${this.pendingResponseRetry}`);
 
       // If this done was triggered by a flushToolBatch cancel-wait, don't
       // touch the notification queue — flushToolBatch will send response.create
       // and the next response.done will drain it.
       if (resolvers.length > 0) {
-        console.log('[Voice] response.done: → early return (flushToolBatch cancel-wait resolved)');
+        if (this.debug) console.debug('[Voice] response.done: → early return (flushToolBatch cancel-wait resolved)');
         return;
       }
 
@@ -224,13 +227,13 @@ export class RealtimeSession {
       if (this.pendingToolCalls.length > 0) {
         const batch = this.pendingToolCalls.splice(0);
         void this.flushToolBatch(batch, this.callbacks!);
-        console.log('[Voice] response.done: → flushing tool batch');
+        if (this.debug) console.debug('[Voice] response.done: → flushing tool batch');
         return;
       }
 
       // Drain notification queue
       if (this.notificationCancelPending || this.notificationQueue.length > 0) {
-        console.log(`[Voice] response.done: → draining notification queue (${this.notificationQueue.length + (this.notificationCancelPending ? 1 : 0)} pending)`);
+        if (this.debug) console.debug(`[Voice] response.done: → draining notification queue (${this.notificationQueue.length + (this.notificationCancelPending ? 1 : 0)} pending)`);
         this.notificationCancelPending = false;
         const next = this.notificationQueue.shift();
         if (next) void this.sendNotification(next);
@@ -241,14 +244,14 @@ export class RealtimeSession {
       // The conversation item already landed; just nudge the server to respond to it.
       if (this.pendingResponseRetry && !this.isResponseActive && this.notificationQueue.length === 0) {
         this.pendingResponseRetry = false;
-        console.log('[Voice] response.done: → firing pendingResponseRetry response.create');
+        if (this.debug) console.debug('[Voice] response.done: → firing pendingResponseRetry response.create');
         if (this.dc && this.dc.readyState === 'open') {
           this.dc.send(JSON.stringify({ type: 'response.create' }));
         }
         return;
       }
 
-      console.debug('[Voice] response.done: → idle, nothing to drain');
+      if (this.debug) console.debug('[Voice] response.done: → idle, nothing to drain');
     } else if (type === 'error') {
       const errorObj = event.error as Record<string, unknown> | undefined;
       const errMsg = (errorObj?.message as string) ?? (event.message as string) ?? JSON.stringify(event);
@@ -257,7 +260,7 @@ export class RealtimeSession {
       // "conversation already has active response" is a timing race we can recover from:
       // our conversation.item.create already landed, so just retry response.create on next response.done.
       if (errCode === 'conversation_already_has_active_response' || errMsg.includes('already has an active response')) {
-        console.warn(`[Voice] Active-response race (suppressed): "${errMsg}" — pendingResponseRetry set`);
+        if (this.debug) console.warn(`[Voice] Active-response race (suppressed): "${errMsg}" — pendingResponseRetry set`);
         this.pendingResponseRetry = true;
         return;
       }
@@ -291,7 +294,7 @@ export class RealtimeSession {
     // before submitting outputs -- otherwise we get
     // conversation_already_has_active_response.
     if (this.isResponseActive) {
-      console.debug('[Voice] Active response detected; sending response.cancel before tool outputs');
+      if (this.debug) console.debug('[Voice] Active response detected; sending response.cancel before tool outputs');
       this.dc.send(JSON.stringify({ type: 'response.cancel' }));
       // Wait for the server to acknowledge the cancel via response.done.
       await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
@@ -311,12 +314,12 @@ export class RealtimeSession {
   injectNotification(threadId: string, text: string): void {
     if (!this.dc || this.dc.readyState !== 'open') return;
 
-    console.log(`[Voice] injectNotification: threadId="${threadId}" isResponseActive=${this.isResponseActive} queueLen=${this.notificationQueue.length} ctx=${JSON.stringify(this.currentResponseContext)}`);
+    if (this.debug) console.debug(`[Voice] injectNotification: threadId="${threadId}" isResponseActive=${this.isResponseActive} queueLen=${this.notificationQueue.length} ctx=${JSON.stringify(this.currentResponseContext)}`);
 
     const item = { threadId, text };
 
     if (!this.isResponseActive) {
-      console.log(`[Voice] injectNotification: no active response — sending immediately`);
+      if (this.debug) console.debug(`[Voice] injectNotification: no active response — sending immediately`);
       void this.sendNotification(item);
       return;
     }
@@ -326,13 +329,13 @@ export class RealtimeSession {
       this.currentResponseContext.threadId === threadId
     ) {
       // Same thread being discussed — cancel and re-queue
-      console.log(`[Voice] injectNotification: same-thread interrupt — cancelling active response and queueing`);
+      if (this.debug) console.debug(`[Voice] injectNotification: same-thread interrupt — cancelling active response and queueing`);
       this.notificationQueue.push(item);
       this.notificationCancelPending = true;
       this.dc.send(JSON.stringify({ type: 'response.cancel' }));
     } else {
       // Different context — queue for later
-      console.log(`[Voice] injectNotification: queuing — different context active`);
+      if (this.debug) console.debug(`[Voice] injectNotification: queuing — different context active`);
       this.notificationQueue.push(item);
     }
   }
@@ -340,17 +343,17 @@ export class RealtimeSession {
   private async sendNotification(item: { threadId: string; text: string }): Promise<void> {
     if (!this.dc || this.dc.readyState !== 'open') return;
 
-    console.log(`[Voice] sendNotification: isResponseActive=${this.isResponseActive} text="${item.text.slice(0, 80)}"`);
+    if (this.debug) console.debug(`[Voice] sendNotification: isResponseActive=${this.isResponseActive} text="${item.text.slice(0, 80)}"`);
 
     // If a response is active, cancel it first (same guard as flushToolBatch)
     if (this.isResponseActive) {
-      console.log(`[Voice] sendNotification: active response detected — cancelling before inject`);
+      if (this.debug) console.debug(`[Voice] sendNotification: active response detected — cancelling before inject`);
       this.dc.send(JSON.stringify({ type: 'response.cancel' }));
       await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
       if (!this.dc || this.dc.readyState !== 'open') return;
-      console.log(`[Voice] sendNotification: cancel resolved — sending conversation.item.create + response.create`);
+      if (this.debug) console.debug(`[Voice] sendNotification: cancel resolved — sending conversation.item.create + response.create`);
     } else {
-      console.log(`[Voice] sendNotification: sending conversation.item.create + response.create`);
+      if (this.debug) console.debug(`[Voice] sendNotification: sending conversation.item.create + response.create`);
     }
 
     this.pendingNotificationContext = { threadId: item.threadId };
@@ -388,6 +391,7 @@ export class RealtimeSession {
       this.pc = null;
     }
     this.callbacks = null;
+    this.debug = false;
     this.notificationQueue = [];
     this.currentResponseContext = null;
     this.pendingNotificationContext = null;

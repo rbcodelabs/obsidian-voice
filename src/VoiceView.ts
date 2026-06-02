@@ -173,7 +173,7 @@ export class VoiceView extends ItemView {
             const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
             const manager = ct?.manager as Parameters<NotificationBridge['connect']>[0] | undefined;
             if (manager) {
-              this.notificationBridge.connect(manager, this.session);
+              this.notificationBridge.connect(manager, this.session, this.plugin.settings.debugLogging);
             }
           }
           // Show what file was captured as context
@@ -232,7 +232,7 @@ export class VoiceView extends ItemView {
         }
         return result;
       },
-    }, allTools);
+    }, allTools, this.plugin.settings.debugLogging);
   }
 
   private doDisconnect(): void {

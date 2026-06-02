@@ -18,8 +18,10 @@ export class NotificationBridge {
   private unsubscribeFn: (() => void) | null = null;
   private session: RealtimeSession | null = null;
   private manager: SubscribableManager | null = null;
+  private debug = false;
 
-  connect(manager: SubscribableManager, session: RealtimeSession): void {
+  connect(manager: SubscribableManager, session: RealtimeSession, debug = false): void {
+    this.debug = debug;
     this.manager = manager;
     this.session = session;
     this.unsubscribeFn = manager.subscribe((threadId, event) => {
@@ -33,6 +35,7 @@ export class NotificationBridge {
     this.session = null;
     this.manager = null;
     this.watchedThreads.clear();
+    this.debug = false;
   }
 
   watch(threadId: string): void {
@@ -57,7 +60,7 @@ export class NotificationBridge {
   }
 
   private handleCtEvent(threadId: string, event: { type: string }): void {
-    console.debug(`[Voice Bridge] CT event: type="${event.type}" threadId="${threadId}" watched=${this.watchedThreads.has(threadId)}`);
+    if (this.debug) console.debug(`[Voice Bridge] CT event: type="${event.type}" threadId="${threadId}" watched=${this.watchedThreads.has(threadId)}`);
     if (!this.watchedThreads.has(threadId)) return;
     if (!this.session) return;
 
@@ -79,7 +82,7 @@ export class NotificationBridge {
       }
     }
 
-    console.debug(`[Voice Bridge] Notification text: ${text ? `"${text.slice(0, 120)}"` : '(suppressed — no text for this event type)'}`);
+    if (this.debug) console.debug(`[Voice Bridge] Notification text: ${text ? `"${text.slice(0, 120)}"` : '(suppressed — no text for this event type)'}`);
 
     if (text) {
       this.session.injectNotification(threadId, text);
