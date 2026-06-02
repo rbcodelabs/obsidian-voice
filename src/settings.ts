@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type VoicePlugin from './main';
+import { isSpeechRecognitionAvailable } from './WakeWordDetector';
 
 export const REALTIME_MODEL = 'gpt-realtime-2';
 export const OPENAI_SECRET_ID = 'openai-api-key';
@@ -16,6 +17,8 @@ export interface VoiceSettings {
   systemPromptExtra: string;
   autoApplyEdits: boolean;
   debugLogging: boolean;
+  wakeWordEnabled: boolean;
+  wakeWord: string;
 }
 
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
@@ -23,6 +26,8 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   systemPromptExtra: '',
   autoApplyEdits: true,
   debugLogging: false,
+  wakeWordEnabled: false,
+  wakeWord: 'hey obsidian',
 };
 
 export class VoiceSettingTab extends PluginSettingTab {
@@ -90,6 +95,56 @@ export class VoiceSettingTab extends PluginSettingTab {
           });
         text.inputEl.rows = 4;
         text.inputEl.style.width = '100%';
+      });
+
+    // Wake word section
+    containerEl.createEl('h2', { text: 'Wake Word' });
+
+    const wakeWordAvailable = isSpeechRecognitionAvailable();
+
+    if (!wakeWordAvailable) {
+      containerEl.createEl('p', {
+        text: 'Wake word is not available: SpeechRecognition API not found in this environment.',
+        cls: 'setting-item-description',
+      });
+    }
+
+    const wakeToggle = new Setting(containerEl)
+      .setName('Enable wake word')
+      .setDesc(
+        'When enabled and the Voice panel is open, the plugin listens for your wake phrase ' +
+        'and auto-connects when it hears it. Uses the browser\'s built-in speech recognition ' +
+        '(Chromium/Electron — audio may be processed by Google).'
+      )
+      .addToggle(toggle => {
+        toggle
+          .setValue(this.plugin.settings.wakeWordEnabled)
+          .setDisabled(!wakeWordAvailable)
+          .onChange(async (value) => {
+            this.plugin.settings.wakeWordEnabled = value;
+            await this.plugin.saveSettings();
+            // Tell the open voice view to start/stop the detector immediately
+            this.plugin.applyWakeWordSetting();
+          });
+      });
+
+    if (!wakeWordAvailable) {
+      wakeToggle.setDisabled(true);
+    }
+
+    new Setting(containerEl)
+      .setName('Wake phrase')
+      .setDesc('The phrase that triggers auto-connect. Case-insensitive. Keep it distinct to avoid false triggers.')
+      .addText(text => {
+        text
+          .setPlaceholder('hey obsidian')
+          .setValue(this.plugin.settings.wakeWord)
+          .setDisabled(!wakeWordAvailable)
+          .onChange(async (value) => {
+            this.plugin.settings.wakeWord = value.trim() || 'hey obsidian';
+            await this.plugin.saveSettings();
+            this.plugin.applyWakeWordSetting();
+          });
       });
 
     containerEl.createEl('h2', { text: 'Developer' });

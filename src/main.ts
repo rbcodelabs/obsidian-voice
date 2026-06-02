@@ -41,6 +41,14 @@ export default class VoicePlugin extends Plugin {
     // view factory recreates VoiceView in the existing leaf automatically.
   }
 
+  /** Called from the settings tab whenever wakeWordEnabled or wakeWord changes. */
+  applyWakeWordSetting(): void {
+    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+    if (leaves.length > 0) {
+      (leaves[0].view as VoiceView).syncWakeWordDetector();
+    }
+  }
+
   async activateView() {
     const { workspace } = this.app;
     let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VOICE_VIEW_TYPE)[0] ?? null;

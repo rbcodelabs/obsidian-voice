@@ -5,6 +5,7 @@ import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
 import { CLAUDE_THREADS_TOOLS, CLAUDE_THREADS_TOOL_NAMES, executeClaudeThreadsTool } from './ClaudeThreadsTools';
 import { NotificationBridge } from './NotificationBridge';
 import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
+import { WakeWordDetector } from './WakeWordDetector';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
@@ -45,6 +46,9 @@ export class VoiceView extends ItemView {
   // the Voice panel itself is active, so Connect always targets the document
   // you were just looking at.
   private lastMarkdownView: MarkdownView | null = null;
+
+  // Wake word
+  private wakeDetector: WakeWordDetector | null = null;
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -115,9 +119,14 @@ export class VoiceView extends ItemView {
     this.transcriptContainer = root.createDiv({ cls: 'voice-transcript' });
 
     this.updateStatus('idle');
+
+    // Start wake word detector if enabled
+    this.syncWakeWordDetector();
   }
 
   async onClose(): Promise<void> {
+    this.wakeDetector?.stop();
+    this.wakeDetector = null;
     this.session?.disconnect();
     this.session = null;
     this.isConnected = false;
@@ -131,16 +140,56 @@ export class VoiceView extends ItemView {
     }
   }
 
+  /**
+   * Called by main.ts whenever wakeWordEnabled or wakeWord changes in settings,
+   * and from onOpen after the UI is ready.
+   */
+  syncWakeWordDetector(): void {
+    const { wakeWordEnabled, wakeWord, debugLogging } = this.plugin.settings;
+
+    // Stop any existing detector first
+    if (this.wakeDetector) {
+      this.wakeDetector.stop();
+      this.wakeDetector = null;
+    }
+
+    if (!wakeWordEnabled || this.isConnected) {
+      this.updateStatus('idle');
+      return;
+    }
+
+    this.wakeDetector = new WakeWordDetector(
+      wakeWord || 'hey obsidian',
+      () => {
+        if (debugLogging) {
+          console.debug('[Voice] Wake word detected — auto-connecting');
+        }
+        this.addToolEvent(`Wake word detected: "${wakeWord}" — connecting…`);
+        void this.doConnect();
+      },
+      debugLogging
+    );
+    this.wakeDetector.start();
+    this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
+  }
+
   private async handleConnectToggle(): Promise<void> {
     return this.toggleConnection();
   }
 
   private async doConnect(): Promise<void> {
+    // Stop wake word detection while the real session is active
+    if (this.wakeDetector) {
+      this.wakeDetector.stop();
+      this.wakeDetector = null;
+    }
+
     const { voice, systemPromptExtra } = this.plugin.settings;
     const apiKey = this.plugin.app.secretStorage.getSecret(OPENAI_SECRET_ID);
 
     if (!apiKey) {
       new Notice('Voice: no OpenAI API key configured. Open Settings to add one.');
+      this.syncWakeWordDetector(); // re-arm the detector
       return;
     }
 
@@ -190,6 +239,8 @@ export class VoiceView extends ItemView {
           this.notificationBridge?.disconnect();
           this.notificationBridge = null;
           this.session = null;
+          // Re-arm wake word detection now that the session has ended
+          this.syncWakeWordDetector();
         }
       },
       onTranscript: (role, text, done) => {
@@ -241,6 +292,8 @@ export class VoiceView extends ItemView {
     this.isConnected = false;
     this.connectBtn.textContent = 'Connect';
     this.updateStatus('idle');
+    // Re-arm wake word detection
+    this.syncWakeWordDetector();
   }
 
   private getMarkdownView(): MarkdownView | null {
@@ -303,14 +356,18 @@ export class VoiceView extends ItemView {
   }
 
   private updateStatus(status: SessionStatus): void {
+    const isListening = !this.isConnected && (this.wakeDetector?.isActive() ?? false);
+
     const labels: Record<SessionStatus, string> = {
-      idle: 'Idle',
+      idle: isListening
+        ? `Listening for "${this.plugin.settings.wakeWord}"…`
+        : 'Idle',
       connecting: 'Connecting...',
       connected: 'Connected',
       error: 'Error',
     };
     const dotClasses: Record<SessionStatus, string> = {
-      idle: 'voice-status__dot--idle',
+      idle: isListening ? 'voice-status__dot--listening' : 'voice-status__dot--idle',
       connecting: 'voice-status__dot--connecting',
       connected: 'voice-status__dot--connected',
       error: 'voice-status__dot--error',
@@ -319,7 +376,13 @@ export class VoiceView extends ItemView {
     this.statusText.textContent = labels[status];
 
     // Remove all status modifier classes then add the right one
-    for (const cls of Object.values(dotClasses)) {
+    for (const cls of [
+      'voice-status__dot--idle',
+      'voice-status__dot--listening',
+      'voice-status__dot--connecting',
+      'voice-status__dot--connected',
+      'voice-status__dot--error',
+    ]) {
       this.statusDot.removeClass(cls);
     }
     this.statusDot.addClass(dotClasses[status]);
