@@ -3,6 +3,7 @@ import type VoicePlugin from './main';
 import { RealtimeSession, SessionStatus } from './RealtimeSession';
 import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
 import { CLAUDE_THREADS_TOOLS, CLAUDE_THREADS_TOOL_NAMES, executeClaudeThreadsTool } from './ClaudeThreadsTools';
+import { NotificationBridge } from './NotificationBridge';
 import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
@@ -39,6 +40,7 @@ export class VoiceView extends ItemView {
   private plugin: VoicePlugin;
   private session: RealtimeSession | null = null;
   private isConnected = false;
+  private notificationBridge: NotificationBridge | null = null;
   // Tracks the last markdown tab the user focused. Stays populated even when
   // the Voice panel itself is active, so Connect always targets the document
   // you were just looking at.
@@ -145,6 +147,9 @@ export class VoiceView extends ItemView {
     const view = this.getMarkdownView();
     const docContent = this.getCurrentDocContent();
     const claudeThreadsAvailable = this.isClaudeThreadsAvailable();
+    if (claudeThreadsAvailable) {
+      this.notificationBridge = new NotificationBridge();
+    }
     const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra, claudeThreadsAvailable);
 
     // Merge document tools, Claude Threads tools (when available), and voice control tools
@@ -163,6 +168,14 @@ export class VoiceView extends ItemView {
           this.isConnected = true;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
+          // Wire notification bridge now that session is live
+          if (this.notificationBridge && this.session) {
+            const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
+            const manager = ct?.manager as Parameters<NotificationBridge['connect']>[0] | undefined;
+            if (manager) {
+              this.notificationBridge.connect(manager, this.session, this.plugin.settings.debugLogging);
+            }
+          }
           // Show what file was captured as context
           if (view?.file) {
             const chars = docContent.length.toLocaleString();
@@ -174,6 +187,8 @@ export class VoiceView extends ItemView {
           this.isConnected = false;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Connect';
+          this.notificationBridge?.disconnect();
+          this.notificationBridge = null;
           this.session = null;
         }
       },
@@ -205,7 +220,7 @@ export class VoiceView extends ItemView {
           await new Promise((r) => setTimeout(r, secs * 1000));
           result = `Waited ${secs} second${secs !== 1 ? 's' : ''}.${args.reason ? ' ' + String(args.reason) : ''}`;
         } else if (CLAUDE_THREADS_TOOL_NAMES.has(name)) {
-          result = await executeClaudeThreadsTool(name, args, this.app);
+          result = await executeClaudeThreadsTool(name, args, this.app, this.notificationBridge);
         } else {
           result = await executeToolCall(name, args, this.app, this.lastMarkdownView);
         }
@@ -217,7 +232,7 @@ export class VoiceView extends ItemView {
         }
         return result;
       },
-    }, allTools);
+    }, allTools, this.plugin.settings.debugLogging);
   }
 
   private doDisconnect(): void {
@@ -274,9 +289,12 @@ export class VoiceView extends ItemView {
     if (hasClaudeThreads) {
       prompt +=
         '\n\nYou also have access to Claude Threads tools (ct_* prefix). ' +
-        'Use ct_new_thread to start a fresh conversation and ct_send_message to reply in an existing thread. ' +
-        'IMPORTANT: ct_new_thread and ct_send_message both have a wait parameter that defaults to true — always leave it as true unless the user explicitly asks to run something in the background. ' +
-        'When wait=true the tool blocks until the agent finishes and returns its response directly, so you can report back immediately without any extra steps.';
+        'Use ct_new_thread to start a fresh agent and ct_send_message to reply in an existing thread. ' +
+        'IMPORTANT: When wait=true (default) the tool blocks until the agent finishes and returns the result directly. ' +
+        'When wait=false, the thread runs in the background — and because watch=true by default, ' +
+        'you will automatically receive a spoken notification when it finishes. ' +
+        'You can also call ct_watch/ct_unwatch at any time to control which threads send you notifications. ' +
+        'When you receive a proactive notification about a thread, acknowledge it naturally in your response.';
     }
     if (extra.trim()) {
       prompt += '\n\n' + extra.trim();
@@ -404,6 +422,14 @@ export class VoiceView extends ItemView {
           : 'Closing active thread…';
       case 'ct_get_active_thread':
         return 'Reading active thread…';
+      case 'ct_watch':
+        return args.thread_id
+          ? `Watching thread · ${String(args.thread_id).slice(0, 8)}…`
+          : 'Watching all threads…';
+      case 'ct_unwatch':
+        return args.thread_id
+          ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}…`
+          : 'Stopped watching all threads…';
       case 'voice_disconnect':
         return 'Disconnecting…';
       case 'voice_wait':
@@ -475,6 +501,18 @@ export class VoiceView extends ItemView {
         return isError ? 'Close thread failed' : 'Thread closed';
       case 'ct_get_active_thread':
         return isError ? 'Read active thread failed' : 'Read active thread';
+      case 'ct_watch':
+        return isError
+          ? 'Watch failed'
+          : args.thread_id
+            ? `Watching · ${String(args.thread_id).slice(0, 8)}`
+            : 'Watching all threads';
+      case 'ct_unwatch':
+        return isError
+          ? 'Unwatch failed'
+          : args.thread_id
+            ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}`
+            : 'Stopped all notifications';
       case 'voice_disconnect':
         return 'Disconnecting…';
       case 'voice_wait':
