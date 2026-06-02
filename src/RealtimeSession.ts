@@ -187,6 +187,7 @@ export class RealtimeSession {
       } else {
         this.currentResponseContext = { type: 'user' };
       }
+      console.debug(`[Voice] response.created — ctx now: ${JSON.stringify(this.currentResponseContext)}`);
     } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
@@ -199,7 +200,7 @@ export class RealtimeSession {
       const callId = (event.call_id as string) ?? '';
       const name = (event.name as string) ?? '';
       const argsJson = (event.arguments as string) ?? '{}';
-      console.debug('[Voice] Tool call buffered:', name, callId);
+      console.debug(`[Voice] Tool call buffered: ${name} (${callId}) — pendingTools now ${this.pendingToolCalls.length + 1}`);
       callbacks.onToolCall(callId, name, argsJson);
       this.pendingToolCalls.push({ callId, name, argsJson });
     } else if (type === 'response.done') {
@@ -209,33 +210,45 @@ export class RealtimeSession {
       const resolvers = this.responseDoneResolvers.splice(0);
       for (const resolve of resolvers) resolve();
 
+      console.log(`[Voice] response.done: resolvers=${resolvers.length} pendingTools=${this.pendingToolCalls.length} notifQueue=${this.notificationQueue.length} notifCancelPending=${this.notificationCancelPending} pendingRetry=${this.pendingResponseRetry}`);
+
       // If this done was triggered by a flushToolBatch cancel-wait, don't
       // touch the notification queue — flushToolBatch will send response.create
       // and the next response.done will drain it.
-      if (resolvers.length > 0) return;
+      if (resolvers.length > 0) {
+        console.log('[Voice] response.done: → early return (flushToolBatch cancel-wait resolved)');
+        return;
+      }
 
       // Tool batch takes priority over notifications
       if (this.pendingToolCalls.length > 0) {
         const batch = this.pendingToolCalls.splice(0);
         void this.flushToolBatch(batch, this.callbacks!);
+        console.log('[Voice] response.done: → flushing tool batch');
         return;
       }
 
       // Drain notification queue
       if (this.notificationCancelPending || this.notificationQueue.length > 0) {
+        console.log(`[Voice] response.done: → draining notification queue (${this.notificationQueue.length + (this.notificationCancelPending ? 1 : 0)} pending)`);
         this.notificationCancelPending = false;
         const next = this.notificationQueue.shift();
         if (next) void this.sendNotification(next);
+        return;
       }
 
       // Retry a response.create that was rejected due to an active-response race.
       // The conversation item already landed; just nudge the server to respond to it.
       if (this.pendingResponseRetry && !this.isResponseActive && this.notificationQueue.length === 0) {
         this.pendingResponseRetry = false;
+        console.log('[Voice] response.done: → firing pendingResponseRetry response.create');
         if (this.dc && this.dc.readyState === 'open') {
           this.dc.send(JSON.stringify({ type: 'response.create' }));
         }
+        return;
       }
+
+      console.debug('[Voice] response.done: → idle, nothing to drain');
     } else if (type === 'error') {
       const errorObj = event.error as Record<string, unknown> | undefined;
       const errMsg = (errorObj?.message as string) ?? (event.message as string) ?? JSON.stringify(event);
@@ -244,7 +257,7 @@ export class RealtimeSession {
       // "conversation already has active response" is a timing race we can recover from:
       // our conversation.item.create already landed, so just retry response.create on next response.done.
       if (errCode === 'conversation_already_has_active_response' || errMsg.includes('already has an active response')) {
-        console.warn('[Voice] Active-response race detected — will retry response.create after current response finishes');
+        console.warn(`[Voice] Active-response race (suppressed): "${errMsg}" — pendingResponseRetry set`);
         this.pendingResponseRetry = true;
         return;
       }
@@ -298,9 +311,12 @@ export class RealtimeSession {
   injectNotification(threadId: string, text: string): void {
     if (!this.dc || this.dc.readyState !== 'open') return;
 
+    console.log(`[Voice] injectNotification: threadId="${threadId}" isResponseActive=${this.isResponseActive} queueLen=${this.notificationQueue.length} ctx=${JSON.stringify(this.currentResponseContext)}`);
+
     const item = { threadId, text };
 
     if (!this.isResponseActive) {
+      console.log(`[Voice] injectNotification: no active response — sending immediately`);
       void this.sendNotification(item);
       return;
     }
@@ -310,11 +326,13 @@ export class RealtimeSession {
       this.currentResponseContext.threadId === threadId
     ) {
       // Same thread being discussed — cancel and re-queue
+      console.log(`[Voice] injectNotification: same-thread interrupt — cancelling active response and queueing`);
       this.notificationQueue.push(item);
       this.notificationCancelPending = true;
       this.dc.send(JSON.stringify({ type: 'response.cancel' }));
     } else {
       // Different context — queue for later
+      console.log(`[Voice] injectNotification: queuing — different context active`);
       this.notificationQueue.push(item);
     }
   }
@@ -322,11 +340,17 @@ export class RealtimeSession {
   private async sendNotification(item: { threadId: string; text: string }): Promise<void> {
     if (!this.dc || this.dc.readyState !== 'open') return;
 
+    console.log(`[Voice] sendNotification: isResponseActive=${this.isResponseActive} text="${item.text.slice(0, 80)}"`);
+
     // If a response is active, cancel it first (same guard as flushToolBatch)
     if (this.isResponseActive) {
+      console.log(`[Voice] sendNotification: active response detected — cancelling before inject`);
       this.dc.send(JSON.stringify({ type: 'response.cancel' }));
       await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
       if (!this.dc || this.dc.readyState !== 'open') return;
+      console.log(`[Voice] sendNotification: cancel resolved — sending conversation.item.create + response.create`);
+    } else {
+      console.log(`[Voice] sendNotification: sending conversation.item.create + response.create`);
     }
 
     this.pendingNotificationContext = { threadId: item.threadId };

@@ -57,6 +57,7 @@ export class NotificationBridge {
   }
 
   private handleCtEvent(threadId: string, event: { type: string }): void {
+    console.debug(`[Voice Bridge] CT event: type="${event.type}" threadId="${threadId}" watched=${this.watchedThreads.has(threadId)}`);
     if (!this.watchedThreads.has(threadId)) return;
     if (!this.session) return;
 
@@ -77,6 +78,8 @@ export class NotificationBridge {
         text = `Thread "${title}" update: ${preview}`;
       }
     }
+
+    console.debug(`[Voice Bridge] Notification text: ${text ? `"${text.slice(0, 120)}"` : '(suppressed — no text for this event type)'}`);
 
     if (text) {
       this.session.injectNotification(threadId, text);
