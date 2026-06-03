@@ -10,6 +10,8 @@ export interface SessionCallbacks {
   onSpeechStarted?: () => void;
   /** Fired when the server VAD detects the user has stopped speaking. */
   onSpeechStopped?: () => void;
+  /** Fired when the server has finished streaming all audio for a response. */
+  onAudioDone?: () => void;
 }
 
 interface PendingToolCall {
@@ -208,6 +210,11 @@ export class RealtimeSession {
     } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
+    } else if (type === 'response.audio.done') {
+      // Audio streaming is complete — the AI has finished talking.
+      // This fires after the last audio chunk, which is a better signal for
+      // "silence has begun" than response.audio_transcript.done (text-only).
+      callbacks.onAudioDone?.();
     } else if (type === 'response.audio_transcript.done') {
       callbacks.onTranscript('assistant', '', true);
     } else if (type === 'conversation.item.input_audio_transcription.completed') {
