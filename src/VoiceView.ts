@@ -50,6 +50,10 @@ export class VoiceView extends ItemView {
   // Wake word
   private wakeDetector: WakeWordDetector | null = null;
 
+  // Silence-timeout: disconnect after this many ms with no user/assistant activity
+  private readonly SILENCE_TIMEOUT_MS = 60_000;
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
   // UI elements
   private statusDot!: HTMLElement;
   private statusText!: HTMLElement;
@@ -125,6 +129,7 @@ export class VoiceView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.clearSilenceTimer();
     this.wakeDetector?.stop();
     this.wakeDetector = null;
     this.session?.disconnect();
@@ -223,6 +228,8 @@ export class VoiceView extends ItemView {
           this.isConnected = true;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
+          // Start the silence watchdog — resets on any user/assistant activity
+          this.resetSilenceTimer();
           // Wire notification bridge now that session is live
           if (this.notificationBridge && this.session) {
             const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
@@ -250,9 +257,11 @@ export class VoiceView extends ItemView {
         }
       },
       onTranscript: (role, text, done) => {
+        this.resetSilenceTimer(); // any speech resets the inactivity clock
         this.handleTranscript(role, text, done);
       },
       onToolCall: (callId, name, argsJson) => {
+        this.resetSilenceTimer(); // tool activity also counts as interaction
         const label = this.formatToolLabel(name, argsJson);
         const el = this.addToolEvent(label);
         this.pendingToolEls.set(callId, el);
@@ -292,7 +301,27 @@ export class VoiceView extends ItemView {
     }, allTools, this.plugin.settings.debugLogging);
   }
 
+  /** Start (or restart) the 60-second inactivity watchdog. */
+  private resetSilenceTimer(): void {
+    this.clearSilenceTimer();
+    this.silenceTimer = setTimeout(() => {
+      if (!this.isConnected) return;
+      this.addToolEvent(
+        'Disconnected after 1 minute of silence — say "hey obsidian" to reconnect'
+      );
+      this.doDisconnect();
+    }, this.SILENCE_TIMEOUT_MS);
+  }
+
+  private clearSilenceTimer(): void {
+    if (this.silenceTimer !== null) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
   private doDisconnect(): void {
+    this.clearSilenceTimer();
     this.session?.disconnect();
     this.session = null;
     this.isConnected = false;
