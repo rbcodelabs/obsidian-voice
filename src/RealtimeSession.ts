@@ -8,6 +8,8 @@ export interface SessionCallbacks {
   getToolResult: (callId: string, name: string, argsJson: string) => Promise<string>;
   /** Fired when the server VAD detects the user has started speaking. */
   onSpeechStarted?: () => void;
+  /** Fired when the server VAD detects the user has stopped speaking. */
+  onSpeechStopped?: () => void;
 }
 
 interface PendingToolCall {
@@ -185,9 +187,12 @@ export class RealtimeSession {
     const type = event.type as string;
 
     if (type === 'input_audio_buffer.speech_started') {
-      // Server VAD detected the user starting to speak — notify the caller so
-      // it can reset any inactivity timer before the transcript even arrives.
       callbacks.onSpeechStarted?.();
+      return;
+    }
+
+    if (type === 'input_audio_buffer.speech_stopped') {
+      callbacks.onSpeechStopped?.();
       return;
     }
 

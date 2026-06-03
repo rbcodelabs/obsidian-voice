@@ -258,7 +258,13 @@ export class VoiceView extends ItemView {
         }
       },
       onSpeechStarted: () => {
-        this.resetSilenceTimer(); // reset the moment VAD detects speech, not after transcription
+        // Pause the silence timer while the user is actively speaking —
+        // it should only count down during genuine silence.
+        this.clearSilenceTimer();
+      },
+      onSpeechStopped: () => {
+        // User finished speaking — start counting silence from now.
+        this.resetSilenceTimer();
       },
       onTranscript: (role, text, done) => {
         this.resetSilenceTimer(); // also reset when the transcript arrives (assistant speech, final user text)
