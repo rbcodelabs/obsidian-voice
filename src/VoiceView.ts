@@ -226,6 +226,7 @@ export class VoiceView extends ItemView {
           this.isConnected = true;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
+          this.playChime('connect');
           // Start the silence watchdog — resets on any user/assistant activity
           this.resetSilenceTimer();
           // Wire notification bridge now that session is live
@@ -244,9 +245,11 @@ export class VoiceView extends ItemView {
             this.addToolEvent('Context snapshot: no document open');
           }
         } else if (status === 'idle' || status === 'error') {
+          const wasConnected = this.isConnected;
           this.isConnected = false;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Connect';
+          if (wasConnected) this.playChime('disconnect');
           this.notificationBridge?.disconnect();
           this.notificationBridge = null;
           this.session = null;
@@ -617,6 +620,46 @@ export class VoiceView extends ItemView {
         return result;
       default:
         return isError ? `${name} failed` : name;
+    }
+  }
+
+  /**
+   * Play a short synthesised chime using the Web Audio API.
+   * connect  → ascending two-note chime  (C5 → G5)
+   * disconnect → descending two-note chime (G5 → C5), quieter
+   */
+  private playChime(type: 'connect' | 'disconnect'): void {
+    try {
+      const ctx = new AudioContext();
+      const master = ctx.createGain();
+      master.gain.value = type === 'connect' ? 0.35 : 0.22;
+      master.connect(ctx.destination);
+
+      // Each note: freq (Hz), start offset (s), total duration (s)
+      const notes: [number, number, number][] =
+        type === 'connect'
+          ? [[523.25, 0, 0.18], [783.99, 0.13, 0.22]] // C5 → G5
+          : [[783.99, 0, 0.14], [523.25, 0.1, 0.22]]; // G5 → C5
+
+      for (const [freq, offset, dur] of notes) {
+        const osc = ctx.createOscillator();
+        const env = ctx.createGain();
+        osc.connect(env);
+        env.connect(master);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const t = ctx.currentTime + offset;
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(1, t + 0.008); // fast attack
+        env.gain.exponentialRampToValueAtTime(0.001, t + dur); // natural decay
+        osc.start(t);
+        osc.stop(t + dur);
+      }
+
+      // Release the AudioContext once both notes have finished
+      setTimeout(() => ctx.close(), 800);
+    } catch {
+      // AudioContext unavailable — skip sound silently
     }
   }
 
