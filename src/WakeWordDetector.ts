@@ -103,31 +103,51 @@ export class WakeWordDetector {
   }
 
   /**
-   * Record exactly BUFFER_SIZE fresh samples, run the full pipeline, and return
-   * the classifier score plus the 96-dim averaged embedding for template storage.
-   * Call startEnrollment() first. Takes ~2.2 s per call.
+   * Listen for up to `windowMs` milliseconds, run inference every `intervalMs`,
+   * and return the PEAK classifier score plus the embedding from that best frame.
+   * Call startEnrollment() first.
+   *
+   * Rolling inference matches how the live detector works: the classifier scores
+   * highest when the phrase sits at the TAIL of the 2.2 s buffer (i.e. the user
+   * just finished speaking).  A single end-of-window snapshot misses this peak
+   * if the user spoke near the start of the window — producing near-zero scores.
    */
-  async captureEnrollmentSample(): Promise<{ score: number; embedding: Float32Array }> {
-    const startCount = this.samplesWritten;
-    const target = startCount + BUFFER_SIZE;
+  async captureEnrollmentSample(
+    windowMs = 3000,
+    intervalMs = 200,
+  ): Promise<{ score: number; embedding: Float32Array }> {
+    // Wait until the circular buffer has accumulated at least one full window
+    while (this.samplesWritten < BUFFER_SIZE && this.audioCtx !== null) {
+      await new Promise<void>(r => setTimeout(r, 50));
+    }
 
-    // Wait for a full fresh buffer
-    await new Promise<void>(resolve => {
-      const poll = () => (this.samplesWritten >= target ? resolve() : setTimeout(poll, 50));
-      setTimeout(poll, 50);
-    });
+    let bestScore = 0;
+    let bestEmbedding = new Float32Array(96);
+    const deadline = Date.now() + windowMs;
 
-    // Copy buffer in chronological order
-    const audio = new Float32Array(BUFFER_SIZE);
-    const head = this.bufferHead;
-    for (let i = 0; i < BUFFER_SIZE; i++) audio[i] = this.buffer[(head + i) % BUFFER_SIZE];
+    while (Date.now() < deadline && this.audioCtx !== null) {
+      // Unwrap circular buffer oldest → newest
+      const audio = new Float32Array(BUFFER_SIZE);
+      const head = this.bufferHead;
+      for (let i = 0; i < BUFFER_SIZE; i++) audio[i] = this.buffer[(head + i) % BUFFER_SIZE];
 
-    const melFrames = await this.runMel(audio);
-    const embeddings = await this.runEmbeddings(melFrames);
-    const score = embeddings.length >= MIN_EMBEDDINGS ? await this.runClassifier(embeddings) : 0;
-    const embedding = this.averageEmbeddings(embeddings.slice(-MIN_EMBEDDINGS));
+      const melFrames = await this.runMel(audio);
+      const embeddings = await this.runEmbeddings(melFrames);
 
-    return { score, embedding };
+      if (embeddings.length >= MIN_EMBEDDINGS) {
+        const score = await this.runClassifier(embeddings);
+        if (this.debug) console.log(`[WakeWord] enroll poll: score=${score.toFixed(3)} best=${bestScore.toFixed(3)}`);
+        if (score > bestScore) {
+          bestScore = score;
+          bestEmbedding = this.averageEmbeddings(embeddings.slice(-MIN_EMBEDDINGS));
+        }
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await new Promise<void>(r => setTimeout(r, Math.min(intervalMs, remaining)));
+    }
+
+    return { score: bestScore, embedding: bestEmbedding };
   }
 
   /** Start listening. Fires async internally; returns immediately. */
