@@ -134,10 +134,32 @@ export class WakeWordDetector {
     ort.env.wasm.numThreads = 1;  // single-threaded — avoids SharedArrayBuffer requirement
     (ort.env.wasm as any).proxy = false; // no proxy worker needed in single-threaded mode
 
-    // Tell ort where to find the WASM glue (.mjs) and binary (.wasm) using
-    // file:// URLs.  Electron's renderer can import/fetch file:// paths
-    // freely.  The trailing slash is required by ort's path concatenation.
-    ort.env.wasm.wasmPaths = `file://${this.modelDir}/`;
+    // Obsidian's Electron renderer blocks BOTH file:// resource loads AND
+    // dynamic import() of local paths.  Work around this by loading both
+    // WASM assets from disk via Node.js fs and serving them through channels
+    // that Electron always permits:
+    //
+    //  • ort-wasm-simd-threaded.mjs  (Emscripten JS glue, ~24 KB)
+    //      → read as text, wrap in a Blob, expose as a blob: URL.
+    //        ort uses wasmPaths.mjs as the target of its dynamic import().
+    //        blob: URLs are never blocked by Electron's local-resource policy.
+    //
+    //  • ort-wasm-simd-threaded.wasm (~12 MB)
+    //      → read as bytes, set on wasmBinary.
+    //        ort skips fetch() entirely when wasmBinary is pre-populated.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs') as typeof import('fs');
+
+    const mjsText = fs.readFileSync(`${this.modelDir}/ort-wasm-simd-threaded.mjs`, 'utf8');
+    const mjsBlobUrl = URL.createObjectURL(
+      new Blob([mjsText], { type: 'application/javascript' }),
+    );
+
+    const wasmBuf = fs.readFileSync(`${this.modelDir}/ort-wasm-simd-threaded.wasm`);
+    ort.env.wasm.wasmBinary = new Uint8Array(wasmBuf.buffer, wasmBuf.byteOffset, wasmBuf.byteLength);
+
+    // wasmPaths.mjs → the dynamic import() target for the Emscripten glue.
+    (ort.env.wasm as any).wasmPaths = { mjs: mjsBlobUrl };
 
     if (this.debug) console.log('[WakeWord] loading ONNX models from', this.modelDir);
 
