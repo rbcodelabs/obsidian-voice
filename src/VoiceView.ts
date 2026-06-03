@@ -50,8 +50,6 @@ export class VoiceView extends ItemView {
   // Wake word
   private wakeDetector: WakeWordDetector | null = null;
 
-  // Silence-timeout: disconnect after this many ms with no user/assistant activity
-  private readonly SILENCE_TIMEOUT_MS = 60_000;
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // UI elements
@@ -301,16 +299,18 @@ export class VoiceView extends ItemView {
     }, allTools, this.plugin.settings.debugLogging);
   }
 
-  /** Start (or restart) the 60-second inactivity watchdog. */
+  /** Start (or restart) the inactivity watchdog using the current setting. No-op if timeout is 0. */
   private resetSilenceTimer(): void {
     this.clearSilenceTimer();
+    const secs = this.plugin.settings.silenceTimeoutSecs;
+    if (!secs) return; // 0 = disabled
     this.silenceTimer = setTimeout(() => {
       if (!this.isConnected) return;
       this.addToolEvent(
-        'Disconnected after 1 minute of silence — say "hey obsidian" to reconnect'
+        `Disconnected after ${secs}s of silence — say "hey obsidian" to reconnect`
       );
       this.doDisconnect();
-    }, this.SILENCE_TIMEOUT_MS);
+    }, secs * 1000);
   }
 
   private clearSilenceTimer(): void {

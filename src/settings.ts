@@ -20,6 +20,8 @@ export interface VoiceSettings {
   wakeWordEnabled: boolean;
   /** Kept for data-model compat; phrase is fixed to "hey obsidian" by the bundled model. */
   wakeWord: string;
+  /** Seconds of silence before the session auto-disconnects (0 = disabled). */
+  silenceTimeoutSecs: number;
 }
 
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
@@ -29,6 +31,7 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   debugLogging: false,
   wakeWordEnabled: false,
   wakeWord: 'hey obsidian',
+  silenceTimeoutSecs: 15,
 };
 
 export class VoiceSettingTab extends PluginSettingTab {
@@ -126,6 +129,27 @@ export class VoiceSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
             this.plugin.applyWakeWordSetting();
           });
+      });
+
+    new Setting(containerEl)
+      .setName('Silence timeout')
+      .setDesc(
+        'Auto-disconnect after this many seconds of silence during a voice session. ' +
+        'The wake word detector re-arms immediately so you can say "hey obsidian" to reconnect. ' +
+        'Set to 0 to disable.',
+      )
+      .addText(text => {
+        text
+          .setPlaceholder('15')
+          .setValue(String(this.plugin.settings.silenceTimeoutSecs))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            this.plugin.settings.silenceTimeoutSecs = isNaN(n) || n < 0 ? 0 : n;
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = 'number';
+        text.inputEl.min = '0';
+        text.inputEl.style.width = '5em';
       });
 
     containerEl.createEl('h2', { text: 'Developer' });
