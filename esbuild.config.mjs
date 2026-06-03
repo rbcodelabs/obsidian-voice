@@ -91,6 +91,20 @@ const ctx = await esbuild.context({
   entryPoints: ['src/main.ts'],
   bundle: true,
   plugins: [syncPlugin],
+  // Force onnxruntime-web to use the WASM browser build instead of the
+  // Node.js build (ort.node.min.mjs).  The Node build calls
+  // createRequire(import.meta.url) at module init time; import.meta.url
+  // becomes undefined when esbuild emits CJS, causing an immediate crash.
+  // The WASM build has no createRequire and works fine with wasmBinary.
+  alias: {
+    'onnxruntime-web': path.resolve(__dirname, 'node_modules/onnxruntime-web/dist/ort.wasm.min.mjs'),
+  },
+  // import.meta.url is undefined in bundled CJS; provide a harmless fallback
+  // so onnxruntime-web's URL-resolution helpers return undefined gracefully
+  // instead of throwing. wasmBinary bypasses URL-based WASM loading anyway.
+  define: {
+    'import.meta.url': JSON.stringify(''),
+  },
   external: [
     'obsidian',
     'electron',

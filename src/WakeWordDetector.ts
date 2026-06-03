@@ -131,7 +131,8 @@ export class WakeWordDetector {
   }
 
   private async loadModels(): Promise<void> {
-    ort.env.wasm.numThreads = 1; // single-threaded avoids SharedArrayBuffer requirement
+    ort.env.wasm.numThreads = 1;  // single-threaded — avoids SharedArrayBuffer requirement
+    (ort.env.wasm as any).proxy = false; // no proxy worker needed in single-threaded mode
 
     // Load the WASM binary from disk and hand it directly to ort, bypassing
     // any fetch() call. This is the most reliable approach in Electron where
