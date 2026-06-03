@@ -185,9 +185,6 @@ export class VoiceView extends ItemView {
       debugLogging,
       this.plugin.settings.wakeWordThreshold,
     );
-    if (this.plugin.settings.enrollmentEmbeddings) {
-      this.wakeDetector.setEnrollmentEmbeddings(this.plugin.settings.enrollmentEmbeddings);
-    }
     this.wakeDetector.start();
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
   }
