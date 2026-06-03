@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
+import { App, PluginSettingTab, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 
 export const REALTIME_MODEL = 'gpt-realtime-2';
@@ -41,15 +41,17 @@ export class VoiceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('OpenAI API Key')
-      .setDesc('Your OpenAI API key. Stored in Obsidian secure storage, not in data.json.')
-      .addComponent(el => {
-        const secret = new SecretComponent(this.app, el);
-        const current = this.app.secretStorage.getSecret(OPENAI_SECRET_ID);
-        if (current) secret.setValue(current);
-        secret.onChange((value) => {
-          this.app.secretStorage.setSecret(OPENAI_SECRET_ID, value);
+      .setDesc('Your OpenAI API key. Stored securely in your OS keychain, not in data.json.')
+      .addText((text) => {
+        text.inputEl.type = 'password';
+        text.inputEl.placeholder = this.app.secretStorage.getSecret(OPENAI_SECRET_ID)
+          ? '••••••••'
+          : 'sk-…';
+        text.inputEl.style.width = '100%';
+        text.onChange((value) => {
+          const trimmed = value.trim();
+          if (trimmed) this.app.secretStorage.setSecret(OPENAI_SECRET_ID, trimmed);
         });
-        return secret;
       });
 
     new Setting(containerEl)
