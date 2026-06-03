@@ -328,6 +328,7 @@ export class VoiceView extends ItemView {
 
   private doDisconnect(): void {
     this.clearSilenceTimer();
+    if (this.isConnected) this.playChime('disconnect');
     this.session?.disconnect();
     this.session = null;
     this.isConnected = false;
