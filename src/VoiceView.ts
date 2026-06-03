@@ -257,8 +257,11 @@ export class VoiceView extends ItemView {
           this.syncWakeWordDetector();
         }
       },
+      onSpeechStarted: () => {
+        this.resetSilenceTimer(); // reset the moment VAD detects speech, not after transcription
+      },
       onTranscript: (role, text, done) => {
-        this.resetSilenceTimer(); // any speech resets the inactivity clock
+        this.resetSilenceTimer(); // also reset when the transcript arrives (assistant speech, final user text)
         this.handleTranscript(role, text, done);
       },
       onToolCall: (callId, name, argsJson) => {
