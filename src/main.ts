@@ -61,6 +61,14 @@ export default class VoicePlugin extends Plugin {
       await this.saveData(data);
     }
 
+    // Clean up any garbage written by SecretComponent (stores key name, not value).
+    // If the stored value doesn't look like an OpenAI key, wipe it so the
+    // settings UI shows "No key set" rather than a confusing masked garbage value.
+    const storedKey = this.app.secretStorage.getSecret(OPENAI_SECRET_ID);
+    if (storedKey && !storedKey.startsWith('sk-')) {
+      this.app.secretStorage.setSecret(OPENAI_SECRET_ID, '');
+    }
+
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 
