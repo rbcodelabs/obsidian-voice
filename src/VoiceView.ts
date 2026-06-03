@@ -143,6 +143,12 @@ export class VoiceView extends ItemView {
     }
   }
 
+  /** Stop the wake word detector without affecting session state. Used by enrollment. */
+  stopWakeDetector(): void {
+    this.wakeDetector?.stop();
+    this.wakeDetector = null;
+  }
+
   /**
    * Called by main.ts whenever wakeWordEnabled or wakeWord changes in settings,
    * and from onOpen after the UI is ready.
@@ -156,7 +162,7 @@ export class VoiceView extends ItemView {
       this.wakeDetector = null;
     }
 
-    if (!wakeWordEnabled || this.isConnected) {
+    if (!wakeWordEnabled || this.isConnected || this.plugin.wakeDetectorSuspended) {
       this.updateStatus('idle');
       return;
     }
@@ -179,6 +185,9 @@ export class VoiceView extends ItemView {
       debugLogging,
       this.plugin.settings.wakeWordThreshold,
     );
+    if (this.plugin.settings.enrollmentEmbeddings) {
+      this.wakeDetector.setEnrollmentEmbeddings(this.plugin.settings.enrollmentEmbeddings);
+    }
     this.wakeDetector.start();
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
   }

@@ -26,6 +26,7 @@ const INFERENCE_INTERVAL_MS = 500;
 // microphone/room variation typically pushes peak scores lower.  0.75 is a
 // better default starting point; tune upward if false-positives are frequent.
 const DEFAULT_THRESHOLD = 0.75;
+const TEMPLATE_SIMILARITY_THRESHOLD = 0.85;
 
 export class WakeWordDetector {
   private active = false;
@@ -45,6 +46,9 @@ export class WakeWordDetector {
   private readonly buffer = new Float32Array(BUFFER_SIZE);
   private bufferHead = 0;
   private samplesWritten = 0;
+
+  // Enrollment embeddings for template matching
+  private enrollmentEmbeddings: Float32Array[] = [];
 
   // ONNX inference sessions (lazy-loaded once, then reused across start/stop cycles)
   private melSession: ort.InferenceSession | null = null;
@@ -78,11 +82,64 @@ export class WakeWordDetector {
     return this.active;
   }
 
+  /**
+   * Start audio + load models without entering the inference loop.
+   * Call before captureEnrollmentSample(). Safe to call if already started.
+   */
+  async startEnrollment(): Promise<void> {
+    await this.ensureModels();
+    if (!this.audioCtx) await this.startAudio();
+  }
+
+  /**
+   * Stop audio capture started by startEnrollment().
+   * Does NOT touch this.active — safe to call independently of start()/stop().
+   */
+  stopEnrollment(): void {
+    if (this.inferenceTimer) { clearInterval(this.inferenceTimer); this.inferenceTimer = null; }
+    this.workletNode?.disconnect(); this.workletNode = null;
+    if (this.mediaStream) { this.mediaStream.getTracks().forEach(t => t.stop()); this.mediaStream = null; }
+    if (this.audioCtx) { this.audioCtx.close(); this.audioCtx = null; }
+  }
+
+  /**
+   * Record exactly BUFFER_SIZE fresh samples, run the full pipeline, and return
+   * the classifier score plus the 96-dim averaged embedding for template storage.
+   * Call startEnrollment() first. Takes ~2.2 s per call.
+   */
+  async captureEnrollmentSample(): Promise<{ score: number; embedding: Float32Array }> {
+    const startCount = this.samplesWritten;
+    const target = startCount + BUFFER_SIZE;
+
+    // Wait for a full fresh buffer
+    await new Promise<void>(resolve => {
+      const poll = () => (this.samplesWritten >= target ? resolve() : setTimeout(poll, 50));
+      setTimeout(poll, 50);
+    });
+
+    // Copy buffer in chronological order
+    const audio = new Float32Array(BUFFER_SIZE);
+    const head = this.bufferHead;
+    for (let i = 0; i < BUFFER_SIZE; i++) audio[i] = this.buffer[(head + i) % BUFFER_SIZE];
+
+    const melFrames = await this.runMel(audio);
+    const embeddings = await this.runEmbeddings(melFrames);
+    const score = embeddings.length >= MIN_EMBEDDINGS ? await this.runClassifier(embeddings) : 0;
+    const embedding = this.averageEmbeddings(embeddings.slice(-MIN_EMBEDDINGS));
+
+    return { score, embedding };
+  }
+
   /** Start listening. Fires async internally; returns immediately. */
   start(): void {
     if (this.active) return;
     this.active = true;
     void this.startAsync();
+  }
+
+  /** Load stored enrollment embeddings from settings (number[][] → Float32Array[]). */
+  setEnrollmentEmbeddings(raw: number[][]): void {
+    this.enrollmentEmbeddings = raw.map(arr => new Float32Array(arr));
   }
 
   stop(): void {
@@ -270,11 +327,14 @@ registerProcessor('${processorName}', _PCMCapture);
 
     this.inferenceRunning = true;
     try {
-      const score = await this.scoreBuffer();
+      const { classifier, template } = await this.scoreBuffer();
       if (this.debug) {
-        console.log(`[WakeWord] score=${score.toFixed(3)} threshold=${this.threshold}`);
+        const tStr = this.enrollmentEmbeddings.length > 0 ? ` template=${template.toFixed(3)}` : '';
+        console.log(`[WakeWord] classifier=${classifier.toFixed(3)}${tStr} threshold=${this.threshold}`);
       }
-      if (score >= this.threshold) {
+      const detected = classifier >= this.threshold ||
+        (this.enrollmentEmbeddings.length > 0 && template >= TEMPLATE_SIMILARITY_THRESHOLD);
+      if (detected) {
         if (this.debug) console.log('[WakeWord] detected!');
         this.stop();
         this.onDetected();
@@ -287,7 +347,7 @@ registerProcessor('${processorName}', _PCMCapture);
   }
 
   /** Unwrap circular buffer and run all three ONNX stages. */
-  private async scoreBuffer(): Promise<number> {
+  private async scoreBuffer(): Promise<{ classifier: number; template: number }> {
     const audio = new Float32Array(BUFFER_SIZE);
     const start = this.bufferHead; // oldest sample
     for (let i = 0; i < BUFFER_SIZE; i++) {
@@ -298,15 +358,42 @@ registerProcessor('${processorName}', _PCMCapture);
     if (this.debug) {
       console.log(`[WakeWord] mel frames: ${melFrames.length} (need ≥${MEL_FRAME_WINDOW})`);
     }
-    if (melFrames.length < MEL_FRAME_WINDOW) return 0;
+    if (melFrames.length < MEL_FRAME_WINDOW) return { classifier: 0, template: 0 };
 
     const embeddings = await this.runEmbeddings(melFrames);
     if (this.debug) {
       console.log(`[WakeWord] embeddings: ${embeddings.length} (need ≥${MIN_EMBEDDINGS})`);
     }
-    if (embeddings.length < MIN_EMBEDDINGS) return 0;
+    if (embeddings.length < MIN_EMBEDDINGS) return { classifier: 0, template: 0 };
 
-    return this.runClassifier(embeddings);
+    const classifier = await this.runClassifier(embeddings);
+
+    let template = 0;
+    if (this.enrollmentEmbeddings.length > 0) {
+      const query = this.averageEmbeddings(embeddings.slice(-MIN_EMBEDDINGS));
+      for (const stored of this.enrollmentEmbeddings) {
+        template = Math.max(template, this.cosineSimilarity(query, stored));
+      }
+    }
+
+    return { classifier, template };
+  }
+
+  // ── Embedding helpers ───────────────────────────────────────────────────
+
+  private averageEmbeddings(embeddings: Float32Array[]): Float32Array {
+    const avg = new Float32Array(96);
+    if (embeddings.length === 0) return avg;
+    for (const e of embeddings) for (let i = 0; i < 96; i++) avg[i] += e[i];
+    for (let i = 0; i < 96; i++) avg[i] /= embeddings.length;
+    return avg;
+  }
+
+  private cosineSimilarity(a: Float32Array, b: Float32Array): number {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+    const denom = Math.sqrt(na) * Math.sqrt(nb);
+    return denom === 0 ? 0 : dot / denom;
   }
 
   // ── Stage 1: Mel spectrogram ────────────────────────────────────────────

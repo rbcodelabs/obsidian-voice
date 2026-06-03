@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 import { isWakeWordAvailable } from './WakeWordDetector';
+import { EnrollmentModal } from './EnrollmentModal';
 
 export const REALTIME_MODEL = 'gpt-realtime-2';
 export const OPENAI_SECRET_ID = 'openai-api-key';
@@ -24,6 +25,8 @@ export interface VoiceSettings {
   silenceTimeoutSecs: number;
   /** Confidence threshold for wake word detection (0–1). Lower = more sensitive, more false positives. */
   wakeWordThreshold: number;
+  /** Voice templates from enrollment (top-3 averaged embedding vectors, each 96 floats). */
+  enrollmentEmbeddings: number[][] | null;
 }
 
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
@@ -35,6 +38,7 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   wakeWord: 'hey obsidian',
   silenceTimeoutSecs: 15,
   wakeWordThreshold: 0.75,
+  enrollmentEmbeddings: null,
 };
 
 export class VoiceSettingTab extends PluginSettingTab {
@@ -131,6 +135,34 @@ export class VoiceSettingTab extends PluginSettingTab {
             this.plugin.settings.wakeWordEnabled = value;
             await this.plugin.saveSettings();
             this.plugin.applyWakeWordSetting();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Calibrate to your voice')
+      .setDesc(
+        this.plugin.settings.enrollmentEmbeddings
+          ? '✓ Calibrated — threshold and voice templates have been personalised to your voice.'
+          : 'Record 5 samples of "hey obsidian" to auto-set the threshold and build voice templates for your mic and voice.',
+      )
+      .addButton(btn => {
+        btn
+          .setButtonText(this.plugin.settings.enrollmentEmbeddings ? 'Re-calibrate' : 'Calibrate')
+          .setCta()
+          .setDisabled(!available)
+          .onClick(() => new EnrollmentModal(this.app, this.plugin).open());
+      })
+      .addButton(btn => {
+        btn
+          .setButtonText('Clear')
+          .setDisabled(!this.plugin.settings.enrollmentEmbeddings)
+          .setWarning()
+          .onClick(async () => {
+            this.plugin.settings.enrollmentEmbeddings = null;
+            this.plugin.settings.wakeWordThreshold = 0.75;
+            await this.plugin.saveSettings();
+            this.plugin.applyWakeWordSetting();
+            this.display(); // re-render settings
           });
       });
 

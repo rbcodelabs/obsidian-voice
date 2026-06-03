@@ -4,6 +4,7 @@ import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab, OPENAI_SECRET_ID } fr
 
 export default class VoicePlugin extends Plugin {
   settings!: VoiceSettings;
+  wakeDetectorSuspended = false;
 
   async onload() {
     await this.loadSettings();
@@ -47,6 +48,17 @@ export default class VoicePlugin extends Plugin {
     if (leaves.length > 0) {
       (leaves[0].view as VoiceView).syncWakeWordDetector();
     }
+  }
+
+  suspendWakeDetector(): void {
+    this.wakeDetectorSuspended = true;
+    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+    if (leaves.length > 0) (leaves[0].view as VoiceView).stopWakeDetector();
+  }
+
+  resumeWakeDetector(): void {
+    this.wakeDetectorSuspended = false;
+    this.applyWakeWordSetting();
   }
 
   async activateView() {
