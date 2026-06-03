@@ -1,6 +1,4 @@
-import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
-// SecretComponent is not in Obsidian's public type declarations but exists at runtime
-const { SecretComponent } = require('obsidian') as { SecretComponent: new (app: App, containerEl: HTMLElement) => { onChange(cb: (name: string) => void): void } };
+import { App, Modal, Notice, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 
 export const REALTIME_MODEL = 'gpt-realtime-2';
