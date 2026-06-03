@@ -22,7 +22,10 @@ const MEL_FRAME_WINDOW = 76;    // mel frames per embedding window
 const EMBEDDING_STRIDE = 8;     // hop between embedding windows
 const MIN_EMBEDDINGS = 16;      // classifier input length
 const INFERENCE_INTERVAL_MS = 500;
-const DEFAULT_THRESHOLD = 0.94; // optimal threshold from training eval
+// 0.94 is the training-set optimum (recall 91.3%, FPPH 0.12), but real-world
+// microphone/room variation typically pushes peak scores lower.  0.75 is a
+// better default starting point; tune upward if false-positives are frequent.
+const DEFAULT_THRESHOLD = 0.75;
 
 export class WakeWordDetector {
   private active = false;
@@ -212,6 +215,18 @@ export class WakeWordDetector {
 
     this.audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
 
+    // Verify the context actually runs at 16 kHz — if the OS/hardware ignores
+    // the request the mel spectrogram model will receive wrong-rate audio and
+    // all scores will be near-zero.
+    if (this.audioCtx.sampleRate !== SAMPLE_RATE) {
+      console.warn(
+        `[WakeWord] AudioContext sample rate is ${this.audioCtx.sampleRate} Hz, ` +
+        `expected ${SAMPLE_RATE} Hz — wake word accuracy will be severely degraded.`
+      );
+    } else if (this.debug) {
+      console.log(`[WakeWord] AudioContext sample rate: ${this.audioCtx.sampleRate} Hz ✓`);
+    }
+
     // Unique name per instance to avoid "already registered" errors on re-start.
     const processorName = `wake-pcm-${Date.now()}`;
     const workletSrc = `
@@ -280,9 +295,15 @@ registerProcessor('${processorName}', _PCMCapture);
     }
 
     const melFrames = await this.runMel(audio);
+    if (this.debug) {
+      console.log(`[WakeWord] mel frames: ${melFrames.length} (need ≥${MEL_FRAME_WINDOW})`);
+    }
     if (melFrames.length < MEL_FRAME_WINDOW) return 0;
 
     const embeddings = await this.runEmbeddings(melFrames);
+    if (this.debug) {
+      console.log(`[WakeWord] embeddings: ${embeddings.length} (need ≥${MIN_EMBEDDINGS})`);
+    }
     if (embeddings.length < MIN_EMBEDDINGS) return 0;
 
     return this.runClassifier(embeddings);

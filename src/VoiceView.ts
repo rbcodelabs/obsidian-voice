@@ -177,6 +177,7 @@ export class VoiceView extends ItemView {
         void this.doConnect();
       },
       debugLogging,
+      this.plugin.settings.wakeWordThreshold,
     );
     this.wakeDetector.start();
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()

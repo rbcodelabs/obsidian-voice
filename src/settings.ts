@@ -22,6 +22,8 @@ export interface VoiceSettings {
   wakeWord: string;
   /** Seconds of silence before the session auto-disconnects (0 = disabled). */
   silenceTimeoutSecs: number;
+  /** Confidence threshold for wake word detection (0–1). Lower = more sensitive, more false positives. */
+  wakeWordThreshold: number;
 }
 
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
@@ -32,6 +34,7 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   wakeWordEnabled: false,
   wakeWord: 'hey obsidian',
   silenceTimeoutSecs: 15,
+  wakeWordThreshold: 0.75,
 };
 
 export class VoiceSettingTab extends PluginSettingTab {
@@ -129,6 +132,30 @@ export class VoiceSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
             this.plugin.applyWakeWordSetting();
           });
+      });
+
+    new Setting(containerEl)
+      .setName('Detection threshold')
+      .setDesc(
+        'Confidence score (0–1) required to trigger wake word detection. ' +
+        'Lower values catch more phrases but may trigger on background speech. ' +
+        'Enable Debug logging to see live scores and tune this value.',
+      )
+      .addText(text => {
+        text
+          .setPlaceholder('0.75')
+          .setValue(String(this.plugin.settings.wakeWordThreshold))
+          .onChange(async (value) => {
+            const n = parseFloat(value);
+            this.plugin.settings.wakeWordThreshold = isNaN(n) ? 0.75 : Math.min(1, Math.max(0, n));
+            await this.plugin.saveSettings();
+            this.plugin.applyWakeWordSetting(); // re-arm detector with new threshold
+          });
+        text.inputEl.type = 'number';
+        text.inputEl.min = '0';
+        text.inputEl.max = '1';
+        text.inputEl.step = '0.05';
+        text.inputEl.style.width = '5em';
       });
 
     new Setting(containerEl)
