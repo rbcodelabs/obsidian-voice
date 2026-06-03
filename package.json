@@ -9,6 +9,9 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "dependencies": {
+    "onnxruntime-web": "^1.26.0"
+  },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "esbuild": "^0.28.0",

@@ -30,6 +30,38 @@ const extraVaults = [
 
 if (!fs.existsSync(outdir)) fs.mkdirSync(outdir, { recursive: true });
 
+// ── Wake word ONNX / WASM assets ──────────────────────────────────────────
+// These files are loaded at runtime from the plugin directory via the filesystem,
+// so they must be present alongside main.js in every deployed location.
+const TRAINING_OUTPUT = path.join(
+  process.env.HOME,
+  'projects/hey-obsidian-wakeword/output/hey_obsidian',
+);
+const ORT_WASM_DIR = path.join(__dirname, 'node_modules/onnxruntime-web/dist');
+const OWW_RESOURCES = path.join(
+  '/opt/homebrew/lib/python3.14/site-packages/livekit/wakeword/resources',
+);
+
+const WAKE_WORD_ASSETS = [
+  // Three-stage ONNX pipeline
+  { src: path.join(OWW_RESOURCES, 'melspectrogram.onnx'),   dest: 'melspectrogram.onnx'   },
+  { src: path.join(OWW_RESOURCES, 'embedding_model.onnx'),  dest: 'embedding_model.onnx'  },
+  { src: path.join(TRAINING_OUTPUT, 'hey_obsidian.onnx'),   dest: 'hey_obsidian.onnx'     },
+  // WASM runtime (single-threaded variant used with numThreads=1)
+  { src: path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.wasm'), dest: 'ort-wasm-simd-threaded.wasm' },
+];
+
+function copyWakeWordAssets(destDir) {
+  for (const { src, dest } of WAKE_WORD_ASSETS) {
+    const target = path.join(destDir, dest);
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, target);
+    } else {
+      console.warn(`[wake-word] asset not found, skipping: ${src}`);
+    }
+  }
+}
+
 function copyToObsidian() {
   const dirs = [];
   if (pluginDir) dirs.push(pluginDir);
@@ -42,6 +74,8 @@ function copyToObsidian() {
       const src = path.join(outdir, file);
       if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, file));
     }
+    // Copy ONNX models and WASM runtime
+    copyWakeWordAssets(dir);
     console.log(`Copied to ${dir}`);
   }
 }
@@ -93,6 +127,9 @@ const ctx = await esbuild.context({
 // Copy static assets
 fs.copyFileSync('manifest.json', 'dist/manifest.json');
 if (fs.existsSync('styles.css')) fs.copyFileSync('styles.css', 'dist/styles.css');
+
+// Copy ONNX + WASM assets to dist/ as well (for local dev inspection)
+copyWakeWordAssets(outdir);
 
 if (isWatch) {
   await ctx.watch();

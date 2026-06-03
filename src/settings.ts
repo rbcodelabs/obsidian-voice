@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type VoicePlugin from './main';
-import { isSpeechRecognitionAvailable } from './WakeWordDetector';
+import { isWakeWordAvailable } from './WakeWordDetector';
 
 export const REALTIME_MODEL = 'gpt-realtime-2';
 export const OPENAI_SECRET_ID = 'openai-api-key';
@@ -18,6 +18,7 @@ export interface VoiceSettings {
   autoApplyEdits: boolean;
   debugLogging: boolean;
   wakeWordEnabled: boolean;
+  /** Kept for data-model compat; phrase is fixed to "hey obsidian" by the bundled model. */
   wakeWord: string;
 }
 
@@ -100,48 +101,28 @@ export class VoiceSettingTab extends PluginSettingTab {
     // Wake word section
     containerEl.createEl('h2', { text: 'Wake Word' });
 
-    const wakeWordAvailable = isSpeechRecognitionAvailable();
+    const available = isWakeWordAvailable();
 
-    if (!wakeWordAvailable) {
+    if (!available) {
       containerEl.createEl('p', {
-        text: 'Wake word is not available: SpeechRecognition API not found in this environment.',
+        text: 'Wake word is not available: microphone access (getUserMedia) not found in this environment.',
         cls: 'setting-item-description',
       });
     }
 
-    const wakeToggle = new Setting(containerEl)
+    new Setting(containerEl)
       .setName('Enable wake word')
       .setDesc(
-        'When enabled and the Voice panel is open, the plugin listens for your wake phrase ' +
-        'and auto-connects when it hears it. Uses the browser\'s built-in speech recognition ' +
-        '(Chromium/Electron — audio may be processed by Google).'
+        'When enabled and the Voice panel is open, the plugin listens for "hey obsidian" ' +
+        'and auto-connects when it hears it. Uses a locally-trained ONNX model — ' +
+        'no audio leaves your device.',
       )
       .addToggle(toggle => {
         toggle
           .setValue(this.plugin.settings.wakeWordEnabled)
-          .setDisabled(!wakeWordAvailable)
+          .setDisabled(!available)
           .onChange(async (value) => {
             this.plugin.settings.wakeWordEnabled = value;
-            await this.plugin.saveSettings();
-            // Tell the open voice view to start/stop the detector immediately
-            this.plugin.applyWakeWordSetting();
-          });
-      });
-
-    if (!wakeWordAvailable) {
-      wakeToggle.setDisabled(true);
-    }
-
-    new Setting(containerEl)
-      .setName('Wake phrase')
-      .setDesc('The phrase that triggers auto-connect. Case-insensitive. Keep it distinct to avoid false triggers.')
-      .addText(text => {
-        text
-          .setPlaceholder('hey obsidian')
-          .setValue(this.plugin.settings.wakeWord)
-          .setDisabled(!wakeWordAvailable)
-          .onChange(async (value) => {
-            this.plugin.settings.wakeWord = value.trim() || 'hey obsidian';
             await this.plugin.saveSettings();
             this.plugin.applyWakeWordSetting();
           });
@@ -151,13 +132,15 @@ export class VoiceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Debug logging')
-      .setDesc('Log detailed [Voice] events to the DevTools console (Cmd+Option+I). Useful for diagnosing notification bridge issues. Disable when not needed.')
+      .setDesc('Log detailed [Voice] and [WakeWord] events to the DevTools console (Cmd+Option+I). Disable when not needed.')
       .addToggle(toggle => {
         toggle
           .setValue(this.plugin.settings.debugLogging)
           .onChange(async (value) => {
             this.plugin.settings.debugLogging = value;
             await this.plugin.saveSettings();
+            // Re-arm the wake word detector so it picks up the new debug flag.
+            this.plugin.applyWakeWordSetting();
           });
       });
   }

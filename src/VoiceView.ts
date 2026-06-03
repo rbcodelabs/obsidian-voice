@@ -145,7 +145,7 @@ export class VoiceView extends ItemView {
    * and from onOpen after the UI is ready.
    */
   syncWakeWordDetector(): void {
-    const { wakeWordEnabled, wakeWord, debugLogging } = this.plugin.settings;
+    const { wakeWordEnabled, debugLogging } = this.plugin.settings;
 
     // Stop any existing detector first
     if (this.wakeDetector) {
@@ -158,16 +158,22 @@ export class VoiceView extends ItemView {
       return;
     }
 
+    // Resolve absolute path to plugin directory so the ONNX models can be read.
+    const adapter = this.plugin.app.vault.adapter as { basePath?: string };
+    const modelDir = adapter.basePath
+      ? `${adapter.basePath}/${this.plugin.manifest.dir}`
+      : this.plugin.manifest.dir;
+
     this.wakeDetector = new WakeWordDetector(
-      wakeWord || 'hey obsidian',
+      modelDir,
       () => {
         if (debugLogging) {
-          console.debug('[Voice] Wake word detected — auto-connecting');
+          console.log('[Voice] Wake word detected — auto-connecting');
         }
-        this.addToolEvent(`Wake word detected: "${wakeWord}" — connecting…`);
+        this.addToolEvent('Wake word detected: "hey obsidian" — connecting…');
         void this.doConnect();
       },
-      debugLogging
+      debugLogging,
     );
     this.wakeDetector.start();
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
