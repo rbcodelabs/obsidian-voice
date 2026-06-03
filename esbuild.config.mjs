@@ -47,8 +47,10 @@ const WAKE_WORD_ASSETS = [
   { src: path.join(OWW_RESOURCES, 'melspectrogram.onnx'),   dest: 'melspectrogram.onnx'   },
   { src: path.join(OWW_RESOURCES, 'embedding_model.onnx'),  dest: 'embedding_model.onnx'  },
   { src: path.join(TRAINING_OUTPUT, 'hey_obsidian.onnx'),   dest: 'hey_obsidian.onnx'     },
-  // WASM runtime (single-threaded variant used with numThreads=1)
+  // WASM runtime — both the binary and the Emscripten JS glue must be present
+  // so onnxruntime-web can import them via file:// URLs (set via wasmPaths).
   { src: path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.wasm'), dest: 'ort-wasm-simd-threaded.wasm' },
+  { src: path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.mjs'),  dest: 'ort-wasm-simd-threaded.mjs'  },
 ];
 
 function copyWakeWordAssets(destDir) {

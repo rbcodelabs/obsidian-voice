@@ -134,11 +134,10 @@ export class WakeWordDetector {
     ort.env.wasm.numThreads = 1;  // single-threaded — avoids SharedArrayBuffer requirement
     (ort.env.wasm as any).proxy = false; // no proxy worker needed in single-threaded mode
 
-    // Load the WASM binary from disk and hand it directly to ort, bypassing
-    // any fetch() call. This is the most reliable approach in Electron where
-    // file:// fetch may be restricted depending on security settings.
-    const wasmBuf = await this.readFile(`${this.modelDir}/ort-wasm-simd-threaded.wasm`);
-    ort.env.wasm.wasmBinary = new Uint8Array(wasmBuf);
+    // Tell ort where to find the WASM glue (.mjs) and binary (.wasm) using
+    // file:// URLs.  Electron's renderer can import/fetch file:// paths
+    // freely.  The trailing slash is required by ort's path concatenation.
+    ort.env.wasm.wasmPaths = `file://${this.modelDir}/`;
 
     if (this.debug) console.log('[WakeWord] loading ONNX models from', this.modelDir);
 
