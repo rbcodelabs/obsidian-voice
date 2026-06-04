@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
+import { AbstractInputSuggest, App, PluginSettingTab, SecretComponent, Setting, TFile } from 'obsidian';
 import type VoicePlugin from './main';
 import { isSpeechRecognitionAvailable } from './WakeWordDetector';
 
@@ -32,6 +32,33 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   wakeWordEnabled: false,
   wakeWord: 'hey obsidian',
 };
+
+/** Fuzzy file suggest for the context-files picker. */
+class VaultFileSuggest extends AbstractInputSuggest<TFile> {
+  private onSelect: (file: TFile) => void;
+
+  constructor(app: App, inputEl: HTMLInputElement, onSelect: (file: TFile) => void) {
+    super(app, inputEl);
+    this.onSelect = onSelect;
+  }
+
+  getSuggestions(query: string): TFile[] {
+    const lower = query.toLowerCase();
+    return this.app.vault.getMarkdownFiles()
+      .filter(f => f.path.toLowerCase().includes(lower))
+      .slice(0, 20);
+  }
+
+  renderSuggestion(file: TFile, el: HTMLElement): void {
+    el.createSpan({ cls: 'voice-suggest-path', text: file.path });
+  }
+
+  selectSuggestion(file: TFile): void {
+    this.onSelect(file);
+    this.setValue('');
+    this.close();
+  }
+}
 
 export class VoiceSettingTab extends PluginSettingTab {
   plugin: VoicePlugin;
@@ -100,30 +127,54 @@ export class VoiceSettingTab extends PluginSettingTab {
         text.inputEl.style.width = '100%';
       });
 
+    // Context files — pill picker with fuzzy file autocomplete
     new Setting(containerEl)
       .setName('Context files')
       .setDesc(
-        'Vault-relative paths to load as persistent context on every session connect. ' +
-        'One path per line (e.g. Claude/orchestrator-agent-documentation.md). ' +
-        'Contents are injected into the system prompt as labeled <context> blocks, ' +
+        'Vault files injected as persistent context on every session connect. ' +
+        'Type to search, select to add. Contents become <context> blocks in the system prompt, ' +
         'after the active document and before the extra system prompt.'
-      )
-      .addTextArea(text => {
-        text
-          .setPlaceholder(
-            'Claude/orchestrator-agent-documentation.md\nClaude/sessions/current-session.md'
-          )
-          .setValue((this.plugin.settings.contextFiles ?? []).join('\n'))
-          .onChange(async (value) => {
-            this.plugin.settings.contextFiles = value
-              .split('\n')
-              .map(l => l.trim())
-              .filter(l => l.length > 0);
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.rows = 5;
-        text.inputEl.style.width = '100%';
+      );
+
+    const pickerEl = containerEl.createDiv({ cls: 'voice-context-file-picker' });
+
+    const renderPills = () => {
+      pickerEl.empty();
+
+      // Existing files as removable pills
+      for (const [i, path] of (this.plugin.settings.contextFiles ?? []).entries()) {
+        const pill = pickerEl.createDiv({ cls: 'voice-context-file-pill' });
+        pill.createSpan({ text: path });
+        const removeBtn = pill.createEl('button', {
+          cls: 'voice-context-file-pill__remove',
+          text: '×',
+          attr: { 'aria-label': `Remove ${path}` },
+        });
+        removeBtn.addEventListener('click', async () => {
+          this.plugin.settings.contextFiles.splice(i, 1);
+          await this.plugin.saveSettings();
+          renderPills();
+        });
+      }
+
+      // Search input
+      const inputEl = pickerEl.createEl('input', {
+        cls: 'voice-context-file-input',
+        attr: { type: 'text', placeholder: 'Search and add a file…', spellcheck: 'false' },
+      }) as HTMLInputElement;
+
+      new VaultFileSuggest(this.app, inputEl, async (file: TFile) => {
+        const files = this.plugin.settings.contextFiles ?? [];
+        if (!files.includes(file.path)) {
+          files.push(file.path);
+          this.plugin.settings.contextFiles = files;
+          await this.plugin.saveSettings();
+        }
+        renderPills();
       });
+    };
+
+    renderPills();
 
     // Wake word section
     containerEl.createEl('h2', { text: 'Wake Word' });
