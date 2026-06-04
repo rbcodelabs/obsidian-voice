@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, Notice, WorkspaceLeaf } from 'obsidian';
+import { ItemView, MarkdownView, Notice, TFile, WorkspaceLeaf } from 'obsidian';
 import type VoicePlugin from './main';
 import { RealtimeSession, SessionStatus } from './RealtimeSession';
 import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
@@ -199,7 +199,8 @@ export class VoiceView extends ItemView {
     if (claudeThreadsAvailable) {
       this.notificationBridge = new NotificationBridge();
     }
-    const systemPrompt = this.buildSystemPrompt(docContent, systemPromptExtra, claudeThreadsAvailable);
+    const { content: contextFilesContent, loadedCount, failedPaths } = await this.loadContextFiles();
+    const systemPrompt = this.buildSystemPrompt(docContent, contextFilesContent, systemPromptExtra, claudeThreadsAvailable);
 
     // Merge document tools, Claude Threads tools (when available), and voice control tools
     const allTools = claudeThreadsAvailable
@@ -231,6 +232,13 @@ export class VoiceView extends ItemView {
             this.addToolEvent(`Context snapshot: ${view.file.name} · ${chars} chars`);
           } else {
             this.addToolEvent('Context snapshot: no document open');
+          }
+          // Report context files loaded
+          if (loadedCount > 0) {
+            this.addToolEvent(`Context files: ${loadedCount} file${loadedCount !== 1 ? 's' : ''} loaded`);
+          }
+          if (failedPaths.length > 0) {
+            this.addToolEvent(`Context files: could not load — ${failedPaths.join(', ')}`);
           }
         } else if (status === 'idle' || status === 'error') {
           this.isConnected = false;
@@ -331,7 +339,12 @@ export class VoiceView extends ItemView {
     }
   }
 
-  private buildSystemPrompt(docContent: string, extra: string, hasClaudeThreads = false): string {
+  private buildSystemPrompt(
+    docContent: string,
+    contextFilesContent: string,
+    extra: string,
+    hasClaudeThreads = false
+  ): string {
     let prompt =
       'You are a voice assistant helping with an Obsidian document. ' +
       'The current document content is:\n\n```\n' +
@@ -349,10 +362,51 @@ export class VoiceView extends ItemView {
         'You can also call ct_watch/ct_unwatch at any time to control which threads send you notifications. ' +
         'When you receive a proactive notification about a thread, acknowledge it naturally in your response.';
     }
+    if (contextFilesContent.trim()) {
+      prompt += '\n\n' + contextFilesContent.trim();
+    }
     if (extra.trim()) {
       prompt += '\n\n' + extra.trim();
     }
     return prompt;
+  }
+
+  /**
+   * Reads each path in settings.contextFiles from the vault and returns
+   * labeled <context> blocks for injection into the system prompt.
+   */
+  private async loadContextFiles(): Promise<{
+    content: string;
+    loadedCount: number;
+    failedPaths: string[];
+  }> {
+    const paths = this.plugin.settings.contextFiles ?? [];
+    if (paths.length === 0) return { content: '', loadedCount: 0, failedPaths: [] };
+
+    const sections: string[] = [];
+    const failedPaths: string[] = [];
+
+    for (const rawPath of paths) {
+      const path = rawPath.trim();
+      if (!path) continue;
+      try {
+        const abstract = this.app.vault.getAbstractFileByPath(path);
+        if (!(abstract instanceof TFile)) {
+          failedPaths.push(path);
+          continue;
+        }
+        const content = await this.app.vault.read(abstract);
+        sections.push(`<context name="${path}">\n${content}\n</context>`);
+      } catch {
+        failedPaths.push(path);
+      }
+    }
+
+    return {
+      content: sections.join('\n\n'),
+      loadedCount: sections.length,
+      failedPaths,
+    };
   }
 
   private updateStatus(status: SessionStatus): void {
