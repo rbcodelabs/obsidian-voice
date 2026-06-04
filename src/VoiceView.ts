@@ -5,6 +5,7 @@ import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
 import { CLAUDE_THREADS_TOOLS, CLAUDE_THREADS_TOOL_NAMES, executeClaudeThreadsTool } from './ClaudeThreadsTools';
 import { NotificationBridge } from './NotificationBridge';
 import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
+import { WakeWordDetector } from './WakeWordDetector';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
@@ -45,6 +46,11 @@ export class VoiceView extends ItemView {
   // the Voice panel itself is active, so Connect always targets the document
   // you were just looking at.
   private lastMarkdownView: MarkdownView | null = null;
+
+  // Wake word
+  private wakeDetector: WakeWordDetector | null = null;
+
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -115,9 +121,15 @@ export class VoiceView extends ItemView {
     this.transcriptContainer = root.createDiv({ cls: 'voice-transcript' });
 
     this.updateStatus('idle');
+
+    // Start wake word detector if enabled
+    this.syncWakeWordDetector();
   }
 
   async onClose(): Promise<void> {
+    this.clearSilenceTimer();
+    this.wakeDetector?.stop();
+    this.wakeDetector = null;
     this.session?.disconnect();
     this.session = null;
     this.isConnected = false;
@@ -131,16 +143,69 @@ export class VoiceView extends ItemView {
     }
   }
 
+  /** Stop the wake word detector without affecting session state. Used by enrollment. */
+  stopWakeDetector(): void {
+    this.wakeDetector?.stop();
+    this.wakeDetector = null;
+  }
+
+  /**
+   * Called by main.ts whenever wakeWordEnabled or wakeWord changes in settings,
+   * and from onOpen after the UI is ready.
+   */
+  syncWakeWordDetector(): void {
+    const { wakeWordEnabled, debugLogging } = this.plugin.settings;
+
+    // Stop any existing detector first
+    if (this.wakeDetector) {
+      this.wakeDetector.stop();
+      this.wakeDetector = null;
+    }
+
+    if (!wakeWordEnabled || this.isConnected || this.plugin.wakeDetectorSuspended) {
+      this.updateStatus('idle');
+      return;
+    }
+
+    // Resolve absolute path to plugin directory so the ONNX models can be read.
+    const adapter = this.plugin.app.vault.adapter as { basePath?: string };
+    const modelDir = adapter.basePath && this.plugin.manifest.dir
+      ? `${adapter.basePath}/${this.plugin.manifest.dir}`
+      : (this.plugin.manifest.dir ?? '');
+
+    this.wakeDetector = new WakeWordDetector(
+      modelDir,
+      () => {
+        if (debugLogging) {
+          console.log('[Voice] Wake word detected — auto-connecting');
+        }
+        this.addToolEvent('Wake word detected: "hey obsidian" — connecting…');
+        void this.doConnect();
+      },
+      debugLogging,
+      this.plugin.settings.wakeWordThreshold,
+    );
+    this.wakeDetector.start();
+    this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
+  }
+
   private async handleConnectToggle(): Promise<void> {
     return this.toggleConnection();
   }
 
   private async doConnect(): Promise<void> {
+    // Stop wake word detection while the real session is active
+    if (this.wakeDetector) {
+      this.wakeDetector.stop();
+      this.wakeDetector = null;
+    }
+
     const { voice, systemPromptExtra } = this.plugin.settings;
     const apiKey = this.plugin.app.secretStorage.getSecret(OPENAI_SECRET_ID);
 
     if (!apiKey) {
       new Notice('Voice: no OpenAI API key configured. Open Settings to add one.');
+      this.syncWakeWordDetector(); // re-arm the detector
       return;
     }
 
@@ -168,6 +233,9 @@ export class VoiceView extends ItemView {
           this.isConnected = true;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
+          this.playChime('connect');
+          // Start the silence watchdog — resets on any user/assistant activity
+          this.resetSilenceTimer();
           // Wire notification bridge now that session is live
           if (this.notificationBridge && this.session) {
             const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
@@ -184,18 +252,44 @@ export class VoiceView extends ItemView {
             this.addToolEvent('Context snapshot: no document open');
           }
         } else if (status === 'idle' || status === 'error') {
+          const wasConnected = this.isConnected;
           this.isConnected = false;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Connect';
+          if (wasConnected) this.playChime('disconnect');
           this.notificationBridge?.disconnect();
           this.notificationBridge = null;
           this.session = null;
+          // Re-arm wake word detection now that the session has ended
+          this.syncWakeWordDetector();
         }
+      },
+      onSpeechStarted: () => {
+        // Pause the silence timer while the user is actively speaking —
+        // it should only count down during genuine silence.
+        this.clearSilenceTimer();
+      },
+      onSpeechStopped: () => {
+        // User finished speaking — start the timer while we wait for the AI to respond.
+        // onResponseStarted will clear it again if the AI picks up quickly.
+        this.resetSilenceTimer();
+      },
+      onResponseStarted: () => {
+        // AI has started generating a response — clear the timer so we don't
+        // disconnect mid-response on a long answer. onAudioDone will restart
+        // it once the AI finishes speaking.
+        this.clearSilenceTimer();
+      },
+      onAudioDone: () => {
+        // AI finished streaming audio — now genuine silence has begun.
+        // Start the countdown from here.
+        this.resetSilenceTimer();
       },
       onTranscript: (role, text, done) => {
         this.handleTranscript(role, text, done);
       },
       onToolCall: (callId, name, argsJson) => {
+        this.resetSilenceTimer(); // tool activity also counts as interaction
         const label = this.formatToolLabel(name, argsJson);
         const el = this.addToolEvent(label);
         this.pendingToolEls.set(callId, el);
@@ -235,12 +329,37 @@ export class VoiceView extends ItemView {
     }, allTools, this.plugin.settings.debugLogging);
   }
 
+  /** Start (or restart) the inactivity watchdog using the current setting. No-op if timeout is 0. */
+  private resetSilenceTimer(): void {
+    this.clearSilenceTimer();
+    const secs = this.plugin.settings.silenceTimeoutSecs;
+    if (!secs) return; // 0 = disabled
+    this.silenceTimer = setTimeout(() => {
+      if (!this.isConnected) return;
+      this.addToolEvent(
+        `Disconnected after ${secs}s of silence — say "hey obsidian" to reconnect`
+      );
+      this.doDisconnect();
+    }, secs * 1000);
+  }
+
+  private clearSilenceTimer(): void {
+    if (this.silenceTimer !== null) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
   private doDisconnect(): void {
+    this.clearSilenceTimer();
+    if (this.isConnected) this.playChime('disconnect');
     this.session?.disconnect();
     this.session = null;
     this.isConnected = false;
     this.connectBtn.textContent = 'Connect';
     this.updateStatus('idle');
+    // Re-arm wake word detection
+    this.syncWakeWordDetector();
   }
 
   private getMarkdownView(): MarkdownView | null {
@@ -303,14 +422,18 @@ export class VoiceView extends ItemView {
   }
 
   private updateStatus(status: SessionStatus): void {
+    const isListening = !this.isConnected && (this.wakeDetector?.isActive() ?? false);
+
     const labels: Record<SessionStatus, string> = {
-      idle: 'Idle',
+      idle: isListening
+        ? `Listening for "${this.plugin.settings.wakeWord}"…`
+        : 'Idle',
       connecting: 'Connecting...',
       connected: 'Connected',
       error: 'Error',
     };
     const dotClasses: Record<SessionStatus, string> = {
-      idle: 'voice-status__dot--idle',
+      idle: isListening ? 'voice-status__dot--listening' : 'voice-status__dot--idle',
       connecting: 'voice-status__dot--connecting',
       connected: 'voice-status__dot--connected',
       error: 'voice-status__dot--error',
@@ -319,7 +442,13 @@ export class VoiceView extends ItemView {
     this.statusText.textContent = labels[status];
 
     // Remove all status modifier classes then add the right one
-    for (const cls of Object.values(dotClasses)) {
+    for (const cls of [
+      'voice-status__dot--idle',
+      'voice-status__dot--listening',
+      'voice-status__dot--connecting',
+      'voice-status__dot--connected',
+      'voice-status__dot--error',
+    ]) {
       this.statusDot.removeClass(cls);
     }
     this.statusDot.addClass(dotClasses[status]);
@@ -519,6 +648,46 @@ export class VoiceView extends ItemView {
         return result;
       default:
         return isError ? `${name} failed` : name;
+    }
+  }
+
+  /**
+   * Play a short synthesised chime using the Web Audio API.
+   * connect  → ascending two-note chime  (C5 → G5)
+   * disconnect → descending two-note chime (G5 → C5), quieter
+   */
+  private playChime(type: 'connect' | 'disconnect'): void {
+    try {
+      const ctx = new AudioContext();
+      const master = ctx.createGain();
+      master.gain.value = type === 'connect' ? 0.35 : 0.22;
+      master.connect(ctx.destination);
+
+      // Each note: freq (Hz), start offset (s), total duration (s)
+      const notes: [number, number, number][] =
+        type === 'connect'
+          ? [[523.25, 0, 0.18], [783.99, 0.13, 0.22]] // C5 → G5
+          : [[783.99, 0, 0.14], [523.25, 0.1, 0.22]]; // G5 → C5
+
+      for (const [freq, offset, dur] of notes) {
+        const osc = ctx.createOscillator();
+        const env = ctx.createGain();
+        osc.connect(env);
+        env.connect(master);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const t = ctx.currentTime + offset;
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(1, t + 0.008); // fast attack
+        env.gain.exponentialRampToValueAtTime(0.001, t + dur); // natural decay
+        osc.start(t);
+        osc.stop(t + dur);
+      }
+
+      // Release the AudioContext once both notes have finished
+      setTimeout(() => ctx.close(), 800);
+    } catch {
+      // AudioContext unavailable — skip sound silently
     }
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "obsidian-voice",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Talk with your documents using OpenAI Realtime Voice",
   "main": "dist/main.js",
   "scripts": {
@@ -8,6 +8,9 @@
     "dev": "node esbuild.config.mjs --watch",
     "test": "vitest run",
     "test:watch": "vitest"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.26.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

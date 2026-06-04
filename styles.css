@@ -203,3 +203,116 @@
     transform: translateY(0);
   }
 }
+
+/* ── Enrollment / Calibration Modal ──────────────────────────────────────── */
+
+.voice-enroll-loading {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.voice-enroll-error {
+  color: var(--text-error);
+}
+
+.voice-enroll-current {
+  text-align: center;
+  padding: 12px 0 8px;
+}
+
+.voice-enroll-label {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.voice-enroll-counter {
+  font-size: 3em;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-accent);
+  margin: 8px 0;
+}
+
+.voice-enroll-hint {
+  font-size: 0.88em;
+  color: var(--text-muted);
+  margin: 4px 0 0;
+}
+
+.voice-enroll-results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.voice-enroll-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+}
+
+.voice-enroll-row-num {
+  width: 18px;
+  text-align: right;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.voice-enroll-bar {
+  flex: 1;
+  height: 8px;
+  background-color: var(--background-modifier-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.voice-enroll-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}
+
+.voice-enroll-bar--good { background-color: var(--color-green); }
+.voice-enroll-bar--ok   { background-color: var(--color-orange); }
+.voice-enroll-bar--poor { background-color: var(--color-red); }
+
+.voice-enroll-score-val {
+  width: 38px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.voice-enroll-check--good { color: var(--color-green); flex-shrink: 0; }
+.voice-enroll-check--warn { color: var(--color-orange); flex-shrink: 0; }
+
+.voice-enroll-summary {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.voice-enroll-summary-line {
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.voice-enroll-warning {
+  color: var(--color-orange);
+  font-size: 0.88em;
+  margin: 6px 0;
+}
+
+.voice-enroll-btn-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}

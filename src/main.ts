@@ -4,6 +4,7 @@ import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab, OPENAI_SECRET_ID } fr
 
 export default class VoicePlugin extends Plugin {
   settings!: VoiceSettings;
+  wakeDetectorSuspended = false;
 
   async onload() {
     await this.loadSettings();
@@ -39,6 +40,25 @@ export default class VoicePlugin extends Plugin {
     // across plugin reloads and BRAT updates. Obsidian serialises the
     // workspace layout including this leaf; when the plugin reloads the
     // view factory recreates VoiceView in the existing leaf automatically.
+  }
+
+  /** Called from the settings tab whenever wakeWordEnabled or wakeWord changes. */
+  applyWakeWordSetting(): void {
+    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+    if (leaves.length > 0) {
+      (leaves[0].view as VoiceView).syncWakeWordDetector();
+    }
+  }
+
+  suspendWakeDetector(): void {
+    this.wakeDetectorSuspended = true;
+    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+    if (leaves.length > 0) (leaves[0].view as VoiceView).stopWakeDetector();
+  }
+
+  resumeWakeDetector(): void {
+    this.wakeDetectorSuspended = false;
+    this.applyWakeWordSetting();
   }
 
   async activateView() {

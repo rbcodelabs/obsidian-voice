@@ -6,6 +6,14 @@ export interface SessionCallbacks {
   onStatusChange: (status: SessionStatus) => void;
   onError: (msg: string) => void;
   getToolResult: (callId: string, name: string, argsJson: string) => Promise<string>;
+  /** Fired when the server VAD detects the user has started speaking. */
+  onSpeechStarted?: () => void;
+  /** Fired when the server VAD detects the user has stopped speaking. */
+  onSpeechStopped?: () => void;
+  /** Fired when the server begins generating a response (response.created). */
+  onResponseStarted?: () => void;
+  /** Fired when the server has finished streaming all audio for a response. */
+  onAudioDone?: () => void;
 }
 
 interface PendingToolCall {
@@ -182,8 +190,19 @@ export class RealtimeSession {
   private handleEvent(event: Record<string, unknown>, callbacks: SessionCallbacks): void {
     const type = event.type as string;
 
+    if (type === 'input_audio_buffer.speech_started') {
+      callbacks.onSpeechStarted?.();
+      return;
+    }
+
+    if (type === 'input_audio_buffer.speech_stopped') {
+      callbacks.onSpeechStopped?.();
+      return;
+    }
+
     if (type === 'response.created') {
       this.isResponseActive = true;
+      callbacks.onResponseStarted?.();
       if (this.pendingNotificationContext) {
         this.currentResponseContext = { type: 'notification', threadId: this.pendingNotificationContext.threadId };
         this.pendingNotificationContext = null;
@@ -194,6 +213,11 @@ export class RealtimeSession {
     } else if (type === 'response.audio_transcript.delta') {
       const delta = (event.delta as string) ?? '';
       if (delta) callbacks.onTranscript('assistant', delta, false);
+    } else if (type === 'response.audio.done') {
+      // Audio streaming is complete — the AI has finished talking.
+      // This fires after the last audio chunk, which is a better signal for
+      // "silence has begun" than response.audio_transcript.done (text-only).
+      callbacks.onAudioDone?.();
     } else if (type === 'response.audio_transcript.done') {
       callbacks.onTranscript('assistant', '', true);
     } else if (type === 'conversation.item.input_audio_transcription.completed') {
