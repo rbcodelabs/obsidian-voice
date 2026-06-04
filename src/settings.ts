@@ -16,6 +16,8 @@ export interface VoiceSettings {
   openaiApiKey?: string;
   voice: RealtimeVoice;
   systemPromptExtra: string;
+  /** Vault-relative paths loaded as persistent context on every session connect. */
+  contextFiles: string[];
   autoApplyEdits: boolean;
   debugLogging: boolean;
   wakeWordEnabled: boolean;
@@ -32,6 +34,7 @@ export interface VoiceSettings {
 export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   voice: 'marin',
   systemPromptExtra: '',
+  contextFiles: [],
   autoApplyEdits: true,
   debugLogging: false,
   wakeWordEnabled: false,
@@ -204,6 +207,31 @@ export class VoiceSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
         text.inputEl.rows = 4;
+        text.inputEl.style.width = '100%';
+      });
+
+    new Setting(containerEl)
+      .setName('Context files')
+      .setDesc(
+        'Vault-relative paths to load as persistent context on every session connect. ' +
+        'One path per line (e.g. Claude/orchestrator-agent-documentation.md). ' +
+        'Contents are injected into the system prompt as labeled <context> blocks, ' +
+        'after the active document and before the extra system prompt.'
+      )
+      .addTextArea(text => {
+        text
+          .setPlaceholder(
+            'Claude/orchestrator-agent-documentation.md\nClaude/sessions/current-session.md'
+          )
+          .setValue((this.plugin.settings.contextFiles ?? []).join('\n'))
+          .onChange(async (value) => {
+            this.plugin.settings.contextFiles = value
+              .split('\n')
+              .map(l => l.trim())
+              .filter(l => l.length > 0);
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.rows = 5;
         text.inputEl.style.width = '100%';
       });
 
