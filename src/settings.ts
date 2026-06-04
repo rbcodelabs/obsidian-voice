@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
+import { App, Modal, Notice, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
 import type VoicePlugin from './main';
 import { isWakeWordAvailable } from './WakeWordDetector';
 import { EnrollmentModal } from './EnrollmentModal';
@@ -41,6 +41,65 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   enrollmentEmbeddings: null,
 };
 
+function maskOpenAiKey(key: string | null | undefined): string {
+  if (!key) return 'No key set';
+  if (key.length <= 12) return '••••••••';
+  return key.slice(0, 8) + '…' + key.slice(-4);
+}
+
+/** Modal for securely entering a new OpenAI API key. */
+class OpenAiKeyModal extends Modal {
+  constructor(app: App, private settingTab: VoiceSettingTab) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl('h2', { text: 'OpenAI API Key' });
+    contentEl.createEl('p', {
+      text: 'Paste your API key from platform.openai.com/api-keys',
+      cls: 'setting-item-description',
+    });
+
+    const input = contentEl.createEl('input', {
+      type: 'password',
+      placeholder: 'sk-…',
+    });
+    input.style.width = '100%';
+    input.style.marginBottom = '1rem';
+
+    const buttonRow = contentEl.createDiv();
+    buttonRow.style.display = 'flex';
+    buttonRow.style.justifyContent = 'flex-end';
+    buttonRow.style.gap = '8px';
+
+    const cancelBtn = buttonRow.createEl('button', { text: 'Cancel' });
+    cancelBtn.addEventListener('click', () => this.close());
+
+    const saveBtn = buttonRow.createEl('button', { text: 'Save', cls: 'mod-cta' });
+    saveBtn.addEventListener('click', () => {
+      const trimmed = input.value.trim();
+      if (!trimmed) return;
+      this.app.secretStorage.setSecret(OPENAI_SECRET_ID, trimmed);
+      new Notice('API key saved');
+      this.close();
+      this.settingTab.display();
+    });
+
+    input.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter') saveBtn.click();
+    });
+
+    setTimeout(() => input.focus(), 50);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 export class VoiceSettingTab extends PluginSettingTab {
   plugin: VoicePlugin;
 
@@ -55,19 +114,58 @@ export class VoiceSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h2', { text: 'Voice Settings' });
 
-    new Setting(containerEl)
-      .setName('OpenAI API Key')
-      .setDesc('Your OpenAI API key. Stored in Obsidian secure storage, not in data.json.')
-      .addComponent(el => {
-        const secret = new SecretComponent(this.app, el);
-        const current = this.app.secretStorage.getSecret(OPENAI_SECRET_ID);
-        if (current) secret.setValue(current);
-        secret.onChange((value) => {
-          this.app.secretStorage.setSecret(OPENAI_SECRET_ID, value);
-        });
-        return secret;
-      });
+    // ── OpenAI API Key ────────────────────────────────────────────────────
+    {
+      const existingKey = this.app.secretStorage.getSecret(OPENAI_SECRET_ID);
+      const maskedKey = maskOpenAiKey(existingKey);
 
+      const keySetting = new Setting(containerEl)
+        .setName('OpenAI API Key')
+        .setDesc('Stored securely in your OS keychain, not in data.json.');
+
+      keySetting.descEl.createEl('br');
+      keySetting.descEl.createEl('span', { text: maskedKey });
+
+      keySetting
+        .addButton((btn) => {
+          if (!existingKey) btn.setCta();
+          btn.setButtonText(existingKey ? 'Change' : 'Set key').onClick(() => {
+            new OpenAiKeyModal(this.app, this).open();
+          });
+        })
+        .addButton((btn) => {
+          btn
+            .setButtonText('Link existing')
+            .setTooltip('Use a key already stored by another plugin')
+            .onClick(() => {
+              const tmp = document.body.createDiv();
+              tmp.style.display = 'none';
+              const picker = new SecretComponent(this.app, tmp);
+              picker.onChange((secretName: string) => {
+                tmp.remove();
+                if (!secretName) return;
+                const actualValue = this.app.secretStorage.getSecret(secretName);
+                if (actualValue) {
+                  this.app.secretStorage.setSecret(OPENAI_SECRET_ID, actualValue);
+                  new Notice('Key linked');
+                  this.display();
+                } else {
+                  new Notice('That secret has no value stored');
+                }
+              });
+              // SecretComponent renders a button — click it to open the picker
+              const inner = tmp.querySelector('button, input') as HTMLElement | null;
+              if (inner) {
+                inner.click();
+              } else {
+                tmp.remove();
+                new Notice('Secret picker not available');
+              }
+            });
+        });
+    }
+
+    // ── Voice ─────────────────────────────────────────────────────────────
     new Setting(containerEl)
       .setName('Voice')
       .setDesc('The voice the AI will use when speaking. Marin and Cedar are Realtime-exclusive.')
@@ -93,6 +191,7 @@ export class VoiceSettingTab extends PluginSettingTab {
           });
       });
 
+    // ── Extra system prompt ───────────────────────────────────────────────
     new Setting(containerEl)
       .setName('Extra system prompt')
       .setDesc('Additional instructions appended to the base system prompt.')
