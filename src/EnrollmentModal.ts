@@ -56,9 +56,9 @@ export class EnrollmentModal extends Modal {
     this.plugin.suspendWakeDetector();
 
     const adapter = this.plugin.app.vault.adapter as { basePath?: string };
-    const modelDir = adapter.basePath
+    const modelDir = adapter.basePath && this.plugin.manifest.dir
       ? `${adapter.basePath}/${this.plugin.manifest.dir}`
-      : this.plugin.manifest.dir;
+      : (this.plugin.manifest.dir ?? '');
 
     this.detector = new WakeWordDetector(
       modelDir,

@@ -118,7 +118,7 @@ export class WakeWordDetector {
     }
 
     let bestScore = 0;
-    let bestEmbedding = new Float32Array(96);
+    let bestEmbedding: Float32Array = new Float32Array(96);
     const deadline = Date.now() + windowMs;
 
     while (Date.now() < deadline && this.audioCtx !== null) {

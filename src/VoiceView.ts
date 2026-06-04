@@ -169,9 +169,9 @@ export class VoiceView extends ItemView {
 
     // Resolve absolute path to plugin directory so the ONNX models can be read.
     const adapter = this.plugin.app.vault.adapter as { basePath?: string };
-    const modelDir = adapter.basePath
+    const modelDir = adapter.basePath && this.plugin.manifest.dir
       ? `${adapter.basePath}/${this.plugin.manifest.dir}`
-      : this.plugin.manifest.dir;
+      : (this.plugin.manifest.dir ?? '');
 
     this.wakeDetector = new WakeWordDetector(
       modelDir,
