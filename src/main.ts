@@ -36,10 +36,13 @@ export default class VoicePlugin extends Plugin {
   }
 
   async onunload() {
-    // Intentionally not detaching leaves here so the panel persists
-    // across plugin reloads and BRAT updates. Obsidian serialises the
-    // workspace layout including this leaf; when the plugin reloads the
-    // view factory recreates VoiceView in the existing leaf automatically.
+    // Detach all Voice panel leaves on unload so Obsidian doesn't keep a
+    // stale VoiceView instance alive across plugin reloads or BRAT updates.
+    // Without this, the old view object stays in the leaf and new code that
+    // calls methods added in the update (e.g. stopWakeDetector) crashes with
+    // "is not a function". The panel reopens automatically via activateView()
+    // the next time the user clicks the ribbon icon or uses the hotkey.
+    this.app.workspace.detachLeavesOfType(VOICE_VIEW_TYPE);
   }
 
   /** Called from the settings tab whenever wakeWordEnabled or wakeWord changes. */
@@ -53,7 +56,11 @@ export default class VoicePlugin extends Plugin {
   suspendWakeDetector(): void {
     this.wakeDetectorSuspended = true;
     const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-    if (leaves.length > 0) (leaves[0].view as VoiceView).stopWakeDetector();
+    if (leaves.length > 0) {
+      const view = leaves[0].view as VoiceView;
+      // Guard against stale view instances that pre-date this method
+      if (typeof view.stopWakeDetector === 'function') view.stopWakeDetector();
+    }
   }
 
   resumeWakeDetector(): void {
