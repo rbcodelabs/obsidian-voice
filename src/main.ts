@@ -74,7 +74,18 @@ export default class VoicePlugin extends Plugin {
 
   resumeWakeDetector(): void {
     this.wakeDetectorSuspended = false;
-    this.applyWakeWordSetting();
+    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
+    if (leaves.length > 0) {
+      const view = leaves[0].view as VoiceView;
+      // activateWakeDetector() reuses the existing detector instance so ONNX
+      // models stay in memory across focus/blur — no "Loading models…" popup.
+      // Falls back to applyWakeWordSetting() only for stale view instances.
+      if (typeof view.activateWakeDetector === 'function') {
+        view.activateWakeDetector();
+      } else {
+        this.applyWakeWordSetting();
+      }
+    }
   }
 
   async activateView() {
