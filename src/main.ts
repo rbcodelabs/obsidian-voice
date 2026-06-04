@@ -33,6 +33,15 @@ export default class VoicePlugin extends Plugin {
     });
 
     this.addSettingTab(new VoiceSettingTab(this.app, this));
+
+    // Only the focused vault window should listen for wake words.
+    // Each vault is its own Electron BrowserWindow; focus/blur fire when the
+    // user switches between them.  registerDomEvent auto-removes on unload.
+    this.registerDomEvent(window, 'blur',  () => this.suspendWakeDetector());
+    this.registerDomEvent(window, 'focus', () => this.resumeWakeDetector());
+    // If this vault window isn't currently focused (e.g. opened in background
+    // by BRAT), start with the detector already suspended.
+    if (!document.hasFocus()) this.wakeDetectorSuspended = true;
   }
 
   async onunload() {
