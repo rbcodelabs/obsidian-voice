@@ -202,6 +202,9 @@ export class RealtimeSession {
     if (this.debug) console.debug(`[Voice] event: ${type}`);
 
     if (type === 'input_audio_buffer.speech_started') {
+      // Cancel any in-progress silence-wait so onAudioDone doesn't fire
+      // mid-sentence if the AI's buffered audio drains while the user is talking.
+      this.silenceWaitPending = false;
       callbacks.onSpeechStarted?.();
       return;
     }
