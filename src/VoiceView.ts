@@ -147,6 +147,7 @@ export class VoiceView extends ItemView {
   stopWakeDetector(): void {
     this.wakeDetector?.stop();
     this.wakeDetector = null;
+    this.updateStatus('idle'); // refresh label to show suspended state if applicable
   }
 
   /**
@@ -432,10 +433,16 @@ export class VoiceView extends ItemView {
 
   private updateStatus(status: SessionStatus): void {
     const isListening = !this.isConnected && (this.wakeDetector?.isActive() ?? false);
+    // Wake word enabled but window is not focused — detector is paused.
+    const isFocusPaused = !this.isConnected &&
+      this.plugin.settings.wakeWordEnabled &&
+      this.plugin.wakeDetectorSuspended;
 
     const labels: Record<SessionStatus, string> = {
       idle: isListening
         ? `Listening for "${this.plugin.settings.wakeWord}"…`
+        : isFocusPaused
+        ? `Wake word paused — window not in focus`
         : 'Idle',
       connecting: 'Connecting...',
       connected: 'Connected',
