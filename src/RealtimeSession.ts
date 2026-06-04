@@ -49,8 +49,8 @@ export class RealtimeSession {
 
   // Audio silence detection — used to find when the AI has actually finished
   // playing audio (not just when the server finished sending it).
-  // response.done / response.audio.done fire when the server is done, but
-  // audio may still be playing from the client-side WebRTC buffer.
+  // response.output_audio.done / response.done fire when the server is done,
+  // but audio may still be playing from the client-side WebRTC buffer.
   private audioCtxForAnalysis: AudioContext | null = null;
   private silenceWaitPending = false;
   // Guards against onAudioDone firing more than once per response.
