@@ -60,15 +60,17 @@ export class EnrollmentModal extends Modal {
       ? `${adapter.basePath}/${this.plugin.manifest.dir}`
       : (this.plugin.manifest.dir ?? '');
 
+    const { contentEl } = this;
+    contentEl.empty();
+    const loadingEl = contentEl.createEl('p', { text: 'Starting up…', cls: 'voice-enroll-loading' });
+
     this.detector = new WakeWordDetector(
       modelDir,
       () => { /* no-op — enrollment doesn't trigger connection */ },
       this.plugin.settings.debugLogging,
+      this.plugin.settings.wakeWordThreshold,
+      (msg) => { loadingEl.textContent = msg; },
     );
-
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('p', { text: 'Starting microphone and loading models…', cls: 'voice-enroll-loading' });
 
     try {
       await this.detector.startEnrollment();
