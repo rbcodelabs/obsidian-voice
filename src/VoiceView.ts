@@ -152,9 +152,26 @@ export class VoiceView extends ItemView {
 
   /** Stop the wake word detector without affecting session state. Used by enrollment. */
   stopWakeDetector(): void {
+    // Stop audio capture but keep the WakeWordDetector instance alive so the
+    // ONNX models stay in memory.  activateWakeDetector() can then resume with
+    // just an audio restart — no model download or re-load on window focus.
     this.wakeDetector?.stop();
-    this.wakeDetector = null;
     this.updateStatus('idle'); // refresh label to show suspended state if applicable
+  }
+
+  /**
+   * Called by main.ts when the vault window regains focus.
+   * Fast path: if a stopped detector instance already exists (models loaded),
+   * just restart audio capture.  Falls back to syncWakeWordDetector() only
+   * when no instance is cached (first use, or after a session disconnect).
+   */
+  activateWakeDetector(): void {
+    if (this.wakeDetector && !this.isConnected && !this.plugin.wakeDetectorSuspended) {
+      this.wakeDetector.start(); // reuses loaded models — no popup
+      this.updateStatus('idle');
+      return;
+    }
+    this.syncWakeWordDetector();
   }
 
   /**
