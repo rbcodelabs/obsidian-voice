@@ -190,6 +190,8 @@ export class RealtimeSession {
   private handleEvent(event: Record<string, unknown>, callbacks: SessionCallbacks): void {
     const type = event.type as string;
 
+    if (this.debug) console.debug(`[Voice] event: ${type}`);
+
     if (type === 'input_audio_buffer.speech_started') {
       callbacks.onSpeechStarted?.();
       return;
@@ -275,7 +277,12 @@ export class RealtimeSession {
         return;
       }
 
-      if (this.debug) console.debug('[Voice] response.done: → idle, nothing to drain');
+      // Session is truly idle — no tools, no notifications, no retry.
+      // Fire onAudioDone here as a reliable fallback for WebRTC mode where
+      // response.audio.done may never arrive on the data channel (audio is
+      // delivered over the media track, not the data channel).
+      callbacks.onAudioDone?.();
+      if (this.debug) console.debug('[Voice] response.done: → idle, firing onAudioDone → silence timer');
     } else if (type === 'error') {
       const errorObj = event.error as Record<string, unknown> | undefined;
       const errMsg = (errorObj?.message as string) ?? (event.message as string) ?? JSON.stringify(event);
