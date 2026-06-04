@@ -1,6 +1,6 @@
 {
   "name": "obsidian-voice",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Talk with your documents using OpenAI Realtime Voice",
   "main": "dist/main.js",
   "scripts": {

@@ -106,6 +106,15 @@ const ctx = await esbuild.context({
   // instead of throwing. wasmBinary bypasses URL-based WASM loading anyway.
   define: {
     'import.meta.url': JSON.stringify(''),
+    // Inline the Emscripten JS glue at build time so it is always available
+    // inside main.js regardless of what files BRAT installs.  The content is
+    // wrapped in a Blob → blob: URL by loadModels(), exactly as before, but
+    // without any disk read that could fail on iCloud-evicted or missing files.
+    '__ORT_MJS_CONTENT__': JSON.stringify(
+      fs.existsSync(path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.mjs'))
+        ? fs.readFileSync(path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.mjs'), 'utf8')
+        : ''
+    ),
   },
   external: [
     'obsidian',
