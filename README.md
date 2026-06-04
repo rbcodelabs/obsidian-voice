@@ -77,47 +77,72 @@ Uses `gpt-realtime-2` via the OpenAI Realtime API (WebRTC).
 
 ## Release Process
 
-Follow these steps **in order**. Version files must be updated and committed **before** building — the artifacts uploaded to GitHub are snapshots of the files at build/upload time.
+Follow these steps **in order**. The golden rule: **edit versions → build → verify dist → commit → tag → release**.
 
-1. **Bump versions first** (both files must match the new version):
+### Steps
+
+1. **Bump versions** in `manifest.json`, `package.json`, and `versions.json` (all three must match):
    ```bash
-   # Edit manifest.json  →  "version": "X.Y.Z"
-   # Edit package.json   →  "version": "X.Y.Z"
+   # manifest.json  →  "version": "X.Y.Z"
+   # package.json   →  "version": "X.Y.Z"
+   # versions.json  →  add "X.Y.Z": "1.11.4"
    ```
 
-2. **Build** so the compiled output is based on the new version:
+2. **Build from inside the repo directory** — `esbuild.config.mjs` uses relative paths for `entryPoints` and `outfile`, so the CWD at build time determines which source files are compiled and where `dist/` is written. **Never invoke it via absolute path from a different directory.**
    ```bash
-   npm run build
+   cd /path/to/repo   # MUST cd first
+   node esbuild.config.mjs
    ```
 
-3. **Commit the version bump**:
+3. **Verify `dist/manifest.json` before doing anything else:**
    ```bash
-   git add manifest.json package.json
+   cat dist/manifest.json   # "version" must equal X.Y.Z — if not, stop and fix
+   ```
+
+4. **Commit and open a PR** (master has branch protection):
+   ```bash
+   git add manifest.json package.json versions.json src/...
    git commit -m "chore: bump version to vX.Y.Z"
+   git push -u origin your-branch
+   gh pr create && gh pr merge --squash --delete-branch
    ```
 
-4. **Merge to master and push the tag**:
+5. **Sync local to merged master, then rebuild** so `dist/` reflects the exact squash-merge commit (not the pre-merge branch state):
    ```bash
-   git checkout master
-   git merge --ff-only <release-branch>
-   git tag vX.Y.Z
-   git push origin master --tags
+   git fetch origin master
+   git reset --hard origin/master
+   node esbuild.config.mjs        # run from same directory
+   cat dist/manifest.json         # confirm X.Y.Z again
    ```
 
-5. **Create the GitHub release from the same directory where you built** — `dist/` in the main checkout is often stale from an older build:
+6. **Tag the merged commit and push:**
    ```bash
-   # Run this from the worktree where npm run build was executed
-   gh release create vX.Y.Z dist/main.js dist/manifest.json dist/styles.css \
-     --title "vX.Y.Z" \
-     --notes "Brief description of changes"
+   MERGE_SHA=$(git rev-parse origin/master)
+   git tag vX.Y.Z $MERGE_SHA
+   git push origin vX.Y.Z
    ```
 
-6. **Verify** the manifest version in the release matches the tag:
+7. **Create the GitHub release** (run from the same directory as the build):
+   ```bash
+   gh release create vX.Y.Z \
+     dist/main.js dist/manifest.json dist/styles.css \
+     dist/melspectrogram.onnx dist/embedding_model.onnx \
+     dist/hey_obsidian.onnx dist/ort-wasm-simd-threaded.wasm \
+     --title "vX.Y.Z — description" \
+     --notes "..."
+   ```
+
+8. **Verify the manifest in the release** — this is the final gate:
    ```bash
    gh release download vX.Y.Z --pattern manifest.json --output /tmp/check.json --clobber
-   cat /tmp/check.json   # "version" must equal X.Y.Z
+   cat /tmp/check.json   # "version" must equal X.Y.Z — if wrong, use --clobber to re-upload
    ```
+   To fix a wrong manifest after the fact: `gh release upload vX.Y.Z dist/manifest.json --clobber`
 
-> **Common mistakes:**
-> - Editing `manifest.json` *after* the build causes the old version to be uploaded. Always edit → build → commit → release.
-> - Running `gh release create` from the main checkout (not the build worktree) uploads a stale `dist/` with an old version. Always run from the directory where `npm run build` was executed.
+### Why the build must happen after `reset --hard`
+
+When working in a git worktree, the branch may have diverged from what GitHub squash-merged. Steps 5–6 ensure the artifact you upload is compiled from the exact commit that is tagged — not from a local pre-merge state with a different version string.
+
+### Why you must `cd` before running esbuild
+
+`esbuild.config.mjs` resolves `entryPoints: ['src/main.ts']` and `outfile: 'dist/main.js'` relative to the **current working directory**, not the script's location. Invoking it as `node /abs/path/to/esbuild.config.mjs` from a different directory silently compiles the wrong source tree into the wrong `dist/`. Always `cd` into the repo first.
