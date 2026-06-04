@@ -51,6 +51,11 @@ export class VoiceView extends ItemView {
   private wakeDetector: WakeWordDetector | null = null;
 
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private countdownInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Real-time session activity — drives the status label while connected
+  private sessionActivity: 'listening' | 'user-speaking' | 'ai-responding' | 'silence' = 'listening';
+  private silenceSecsLeft = 0;
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -243,6 +248,7 @@ export class VoiceView extends ItemView {
         this.updateStatus(status);
         if (status === 'connected') {
           this.isConnected = true;
+          this.sessionActivity = 'listening';
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
           this.playChime('connect');
@@ -277,24 +283,22 @@ export class VoiceView extends ItemView {
         }
       },
       onSpeechStarted: () => {
-        // Pause the silence timer while the user is actively speaking —
-        // it should only count down during genuine silence.
+        this.sessionActivity = 'user-speaking';
         this.clearSilenceTimer();
+        this.refreshConnectedStatus();
       },
       onSpeechStopped: () => {
-        // User finished speaking — start the timer while we wait for the AI to respond.
-        // onResponseStarted will clear it again if the AI picks up quickly.
+        // User finished — wait for AI to pick up; resetSilenceTimer sets
+        // activity to 'silence' and starts the countdown.
         this.resetSilenceTimer();
       },
       onResponseStarted: () => {
-        // AI has started generating a response — clear the timer so we don't
-        // disconnect mid-response on a long answer. onAudioDone will restart
-        // it once the AI finishes speaking.
+        this.sessionActivity = 'ai-responding';
         this.clearSilenceTimer();
+        this.refreshConnectedStatus();
       },
       onAudioDone: () => {
-        // AI finished streaming audio — now genuine silence has begun.
-        // Start the countdown from here.
+        // AI finished streaming audio — genuine silence begins now.
         this.resetSilenceTimer();
       },
       onTranscript: (role, text, done) => {
@@ -346,8 +350,20 @@ export class VoiceView extends ItemView {
     this.clearSilenceTimer();
     const secs = this.plugin.settings.silenceTimeoutSecs;
     if (!secs) return; // 0 = disabled
+
+    this.sessionActivity = 'silence';
+    this.silenceSecsLeft = secs;
+    this.refreshConnectedStatus();
+
+    // Tick every second to keep the countdown live in the status bar
+    this.countdownInterval = setInterval(() => {
+      this.silenceSecsLeft = Math.max(0, this.silenceSecsLeft - 1);
+      this.refreshConnectedStatus();
+    }, 1000);
+
     this.silenceTimer = setTimeout(() => {
       if (!this.isConnected) return;
+      this.clearCountdownInterval();
       this.addToolEvent(
         `Disconnected after ${secs}s of silence — say "hey obsidian" to reconnect`
       );
@@ -360,6 +376,19 @@ export class VoiceView extends ItemView {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
     }
+    this.clearCountdownInterval();
+  }
+
+  private clearCountdownInterval(): void {
+    if (this.countdownInterval !== null) {
+      clearInterval(this.countdownInterval);
+      this.countdownInterval = null;
+    }
+  }
+
+  /** Re-render the status label without changing the session status. */
+  private refreshConnectedStatus(): void {
+    if (this.isConnected) this.updateStatus('connected');
   }
 
   private doDisconnect(): void {
@@ -440,20 +469,36 @@ export class VoiceView extends ItemView {
       this.plugin.settings.wakeWordEnabled &&
       this.plugin.wakeDetectorSuspended;
 
+    const connectedLabel = (): string => {
+      switch (this.sessionActivity) {
+        case 'user-speaking':  return 'You\'re speaking…';
+        case 'ai-responding':  return 'AI responding…';
+        case 'silence':        return `Silence — ${this.silenceSecsLeft}s`;
+        default:               return 'Connected';
+      }
+    };
+    const connectedDot = (): string => {
+      switch (this.sessionActivity) {
+        case 'user-speaking': return 'voice-status__dot--listening';  // accent pulse
+        case 'ai-responding': return 'voice-status__dot--connecting'; // yellow pulse
+        default:              return 'voice-status__dot--connected';   // static green
+      }
+    };
+
     const labels: Record<SessionStatus, string> = {
       idle: isListening
         ? `Listening for "${this.plugin.settings.wakeWord}"…`
         : isFocusPaused
         ? `Wake word paused — window not in focus`
         : 'Idle',
-      connecting: 'Connecting...',
-      connected: 'Connected',
+      connecting: 'Connecting…',
+      connected: connectedLabel(),
       error: 'Error',
     };
     const dotClasses: Record<SessionStatus, string> = {
       idle: isListening ? 'voice-status__dot--listening' : 'voice-status__dot--idle',
       connecting: 'voice-status__dot--connecting',
-      connected: 'voice-status__dot--connected',
+      connected: connectedDot(),
       error: 'voice-status__dot--error',
     };
 
