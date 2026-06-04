@@ -58,6 +58,16 @@ Without calibration the default threshold (0.75) works for many users; calibrati
 
 Once connected, just speak. The AI has your document in context and can answer questions or edit it on request. Tool actions appear as pills in the transcript so you can follow along.
 
+The status bar shows real-time session activity:
+
+| Status | Meaning |
+|---|---|
+| **Listening…** | Wake word detector is active, waiting for "hey obsidian" |
+| **You're speaking…** | Server VAD has detected your voice |
+| **AI responding…** | AI is generating and playing audio |
+| **Silence — 12s** | No activity; countdown to auto-disconnect |
+| **Connected** | Connected but idle (no VAD activity) |
+
 To assign a hotkey: Settings → Hotkeys → search "Toggle Voice connection".
 
 ## Settings reference
@@ -74,6 +84,18 @@ To assign a hotkey: Settings → Hotkeys → search "Toggle Voice connection".
 ## Model
 
 Uses `gpt-realtime-2` via the OpenAI Realtime API (WebRTC).
+
+## Debugging
+
+`debug-realtime.mjs` is a Node.js probe script that connects directly to the OpenAI Realtime API via WebSocket and logs every event with timestamps, delta timings between events, and a session summary. Useful for understanding API event sequencing and timing without needing a full Obsidian reload cycle.
+
+```bash
+# Run from the repo root (reads OPENAI_API_KEY from env or .env file)
+OPENAI_API_KEY=sk-... node debug-realtime.mjs
+OPENAI_API_KEY=sk-... node debug-realtime.mjs "What is 2 + 2?"
+```
+
+Requires `ws` (already listed as a devDependency — run `npm install` first).
 
 ## Release Process
 
