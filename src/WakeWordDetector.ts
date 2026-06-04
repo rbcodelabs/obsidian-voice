@@ -14,6 +14,10 @@
 
 import * as ort from 'onnxruntime-web';
 
+// Inlined at build time by esbuild define — contains the Emscripten JS glue
+// for ort-wasm-simd-threaded.mjs so no disk read is required at runtime.
+declare const __ORT_MJS_CONTENT__: string;
+
 // ── constants matching the Python training pipeline ────────────────────────
 const SAMPLE_RATE = 16000;
 const BUFFER_SECONDS = 2.2;
@@ -208,35 +212,26 @@ export class WakeWordDetector {
     ort.env.wasm.numThreads = 1;  // single-threaded — avoids SharedArrayBuffer requirement
     (ort.env.wasm as any).proxy = false; // no proxy worker needed in single-threaded mode
 
-    // Download any missing assets (first run after BRAT install).
+    // Download any missing or stale assets (first run after BRAT install, or
+    // after iCloud Drive evicts cached files from the plugin directory).
     await this.ensureAssets();
 
-    // Obsidian's Electron renderer blocks BOTH file:// resource loads AND
-    // dynamic import() of local paths.  Work around this by loading both
-    // WASM assets from disk via Node.js fs and serving them through channels
-    // that Electron always permits:
-    //
-    //  • ort-wasm-simd-threaded.mjs  (Emscripten JS glue, ~24 KB)
-    //      → read as text, wrap in a Blob, expose as a blob: URL.
-    //        ort uses wasmPaths.mjs as the target of its dynamic import().
-    //        blob: URLs are never blocked by Electron's local-resource policy.
-    //
-    //  • ort-wasm-simd-threaded.wasm (~12 MB)
-    //      → read as bytes, set on wasmBinary.
-    //        ort skips fetch() entirely when wasmBinary is pre-populated.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const fs = require('fs') as typeof import('fs');
 
-    const mjsText = fs.readFileSync(`${this.modelDir}/ort-wasm-simd-threaded.mjs`, 'utf8');
+    // The Emscripten JS glue (.mjs, ~24 KB) is inlined into main.js at build
+    // time via esbuild define → __ORT_MJS_CONTENT__.  This avoids any disk read
+    // for a file that BRAT does not install and that iCloud may evict.
+    // Obsidian's Electron renderer blocks file:// imports; a blob: URL is fine.
     const mjsBlobUrl = URL.createObjectURL(
-      new Blob([mjsText], { type: 'application/javascript' }),
+      new Blob([__ORT_MJS_CONTENT__], { type: 'application/javascript' }),
     );
+    (ort.env.wasm as any).wasmPaths = { mjs: mjsBlobUrl };
 
+    // The WASM binary (~12 MB) is downloaded once and cached to the plugin
+    // directory by ensureAssets().  Read it from the local cache here.
     const wasmBuf = fs.readFileSync(`${this.modelDir}/ort-wasm-simd-threaded.wasm`);
     ort.env.wasm.wasmBinary = new Uint8Array(wasmBuf.buffer, wasmBuf.byteOffset, wasmBuf.byteLength);
-
-    // wasmPaths.mjs → the dynamic import() target for the Emscripten glue.
-    (ort.env.wasm as any).wasmPaths = { mjs: mjsBlobUrl };
 
     if (this.debug) console.log('[WakeWord] loading ONNX models from', this.modelDir);
 
@@ -284,17 +279,30 @@ export class WakeWordDetector {
     // Always pulls from whichever release is tagged "latest" on GitHub.
     const GH = 'https://github.com/rbcodelabs/obsidian-voice/releases/latest/download';
 
-    const assets: Array<{ url: string; file: string }> = [
-      { url: `${CDN}/ort-wasm-simd-threaded.mjs`,  file: 'ort-wasm-simd-threaded.mjs'  },
-      { url: `${CDN}/ort-wasm-simd-threaded.wasm`, file: 'ort-wasm-simd-threaded.wasm' },
-      { url: `${GH}/melspectrogram.onnx`,           file: 'melspectrogram.onnx'          },
-      { url: `${GH}/embedding_model.onnx`,          file: 'embedding_model.onnx'         },
-      { url: `${GH}/hey_obsidian.onnx`,             file: 'hey_obsidian.onnx'            },
+    // .mjs is inlined into main.js at build time via __ORT_MJS_CONTENT__ — no
+    // disk copy needed.  Only the binary WASM and the three ONNX models are cached.
+    const assets: Array<{ url: string; file: string; minSize: number }> = [
+      { url: `${CDN}/ort-wasm-simd-threaded.wasm`, file: 'ort-wasm-simd-threaded.wasm', minSize: 10_000_000 },
+      { url: `${GH}/melspectrogram.onnx`,           file: 'melspectrogram.onnx',          minSize: 10_000    },
+      { url: `${GH}/embedding_model.onnx`,          file: 'embedding_model.onnx',         minSize: 10_000    },
+      { url: `${GH}/hey_obsidian.onnx`,             file: 'hey_obsidian.onnx',            minSize: 10_000    },
     ];
 
-    for (const { url, file } of assets) {
+    for (const { url, file, minSize } of assets) {
       const dest = `${this.modelDir}/${file}`;
-      if (fs.existsSync(dest)) continue;
+
+      // Size-based validation instead of existsSync: iCloud Drive can evict file
+      // data while leaving a placeholder entry that passes existsSync but causes
+      // ENOENT when readFileSync is called.  A non-zero size proves the bytes are
+      // actually present on disk.
+      const isUsable = (() => {
+        try { return fs.statSync(dest).size >= minSize; }
+        catch { return false; }
+      })();
+      if (isUsable) continue;
+
+      // Remove any zero-byte iCloud placeholder before writing the fresh download.
+      try { fs.unlinkSync(dest); } catch { /* ignore — may not exist at all */ }
 
       this.onProgress?.(`Downloading ${file}…`);
       if (this.debug) console.log(`[WakeWord] downloading ${file}`);
