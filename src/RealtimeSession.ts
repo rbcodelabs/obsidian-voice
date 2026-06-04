@@ -10,6 +10,8 @@ export interface SessionCallbacks {
   onSpeechStarted?: () => void;
   /** Fired when the server VAD detects the user has stopped speaking. */
   onSpeechStopped?: () => void;
+  /** Fired when the server begins generating a response (response.created). */
+  onResponseStarted?: () => void;
   /** Fired when the server has finished streaming all audio for a response. */
   onAudioDone?: () => void;
 }
@@ -200,6 +202,7 @@ export class RealtimeSession {
 
     if (type === 'response.created') {
       this.isResponseActive = true;
+      callbacks.onResponseStarted?.();
       if (this.pendingNotificationContext) {
         this.currentResponseContext = { type: 'notification', threadId: this.pendingNotificationContext.threadId };
         this.pendingNotificationContext = null;

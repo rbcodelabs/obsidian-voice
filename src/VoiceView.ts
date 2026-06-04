@@ -271,12 +271,18 @@ export class VoiceView extends ItemView {
       },
       onSpeechStopped: () => {
         // User finished speaking — start the timer while we wait for the AI to respond.
+        // onResponseStarted will clear it again if the AI picks up quickly.
         this.resetSilenceTimer();
       },
+      onResponseStarted: () => {
+        // AI has started generating a response — clear the timer so we don't
+        // disconnect mid-response on a long answer. onAudioDone will restart
+        // it once the AI finishes speaking.
+        this.clearSilenceTimer();
+      },
       onAudioDone: () => {
-        // AI finished streaming audio (the last chunk has been sent).
-        // This is the authoritative "silence has begun" moment — start the
-        // countdown from here, not from when the transcript text finished.
+        // AI finished streaming audio — now genuine silence has begun.
+        // Start the countdown from here.
         this.resetSilenceTimer();
       },
       onTranscript: (role, text, done) => {
