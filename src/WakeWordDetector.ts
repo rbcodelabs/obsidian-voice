@@ -60,13 +60,16 @@ export class WakeWordDetector {
    * @param onDetected Called once when the wake phrase is detected; the detector
    *                   stops itself before invoking this callback.
    * @param debug      Log inference scores and state transitions to console.
-   * @param threshold  Classifier confidence threshold (default 0.94).
+   * @param threshold  Classifier confidence threshold (default 0.75).
+   * @param onProgress Optional callback for download-progress messages shown
+   *                   when assets need to be fetched on first use.
    */
   constructor(
     modelDir: string,
     onDetected: () => void,
     debug = false,
     threshold = DEFAULT_THRESHOLD,
+    private onProgress?: (msg: string) => void,
   ) {
     this.modelDir = modelDir;
     this.onDetected = onDetected;
@@ -205,6 +208,9 @@ export class WakeWordDetector {
     ort.env.wasm.numThreads = 1;  // single-threaded — avoids SharedArrayBuffer requirement
     (ort.env.wasm as any).proxy = false; // no proxy worker needed in single-threaded mode
 
+    // Download any missing assets (first run after BRAT install).
+    await this.ensureAssets();
+
     // Obsidian's Electron renderer blocks BOTH file:// resource loads AND
     // dynamic import() of local paths.  Work around this by loading both
     // WASM assets from disk via Node.js fs and serving them through channels
@@ -252,6 +258,57 @@ export class WakeWordDetector {
 
     this.modelsLoaded = true;
     if (this.debug) console.log('[WakeWord] models ready');
+  }
+
+  /**
+   * Download any missing runtime assets into modelDir.
+   *
+   * BRAT only installs main.js / manifest.json / styles.css.  The ONNX models
+   * and WASM runtime are not part of the standard Obsidian plugin bundle, so we
+   * fetch them on first use and cache them to the plugin directory.
+   *
+   *  • WASM runtime  — served from the jsDelivr CDN (pinned to the version of
+   *    onnxruntime-web bundled in main.js, so compatibility is guaranteed).
+   *  • ONNX models   — downloaded from the latest GitHub release of this plugin.
+   *
+   * Total first-run download: ~14 MB (12 MB WASM + ~2.5 MB models).
+   * Subsequent starts read from the local cache and skip this step entirely.
+   */
+  private async ensureAssets(): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs') as typeof import('fs');
+
+    // onnxruntime-web version — must match the version in package.json.
+    const ORT_VERSION = '1.26.0';
+    const CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist`;
+    // Always pulls from whichever release is tagged "latest" on GitHub.
+    const GH = 'https://github.com/rbcodelabs/obsidian-voice/releases/latest/download';
+
+    const assets: Array<{ url: string; file: string }> = [
+      { url: `${CDN}/ort-wasm-simd-threaded.mjs`,  file: 'ort-wasm-simd-threaded.mjs'  },
+      { url: `${CDN}/ort-wasm-simd-threaded.wasm`, file: 'ort-wasm-simd-threaded.wasm' },
+      { url: `${GH}/melspectrogram.onnx`,           file: 'melspectrogram.onnx'          },
+      { url: `${GH}/embedding_model.onnx`,          file: 'embedding_model.onnx'         },
+      { url: `${GH}/hey_obsidian.onnx`,             file: 'hey_obsidian.onnx'            },
+    ];
+
+    for (const { url, file } of assets) {
+      const dest = `${this.modelDir}/${file}`;
+      if (fs.existsSync(dest)) continue;
+
+      this.onProgress?.(`Downloading ${file}…`);
+      if (this.debug) console.log(`[WakeWord] downloading ${file}`);
+
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed to download ${file}: ${res.status} ${res.statusText}`);
+
+      const buf = await res.arrayBuffer();
+      fs.writeFileSync(dest, Buffer.from(buf));
+
+      if (this.debug) console.log(`[WakeWord] saved ${file} (${(buf.byteLength / 1024).toFixed(0)} KB)`);
+    }
+
+    this.onProgress?.('Loading models…');
   }
 
   /** Read a file from the local filesystem via Node.js fs (available in Electron). */

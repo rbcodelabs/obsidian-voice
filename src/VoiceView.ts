@@ -173,6 +173,7 @@ export class VoiceView extends ItemView {
       ? `${adapter.basePath}/${this.plugin.manifest.dir}`
       : (this.plugin.manifest.dir ?? '');
 
+    let downloadNotice: Notice | null = null;
     this.wakeDetector = new WakeWordDetector(
       modelDir,
       () => {
@@ -184,6 +185,14 @@ export class VoiceView extends ItemView {
       },
       debugLogging,
       this.plugin.settings.wakeWordThreshold,
+      (msg) => {
+        // Show a transient notice while assets download on first use.
+        if (!downloadNotice) downloadNotice = new Notice(msg, 0);
+        else downloadNotice.setMessage(msg);
+        if (msg === 'Loading models…') {
+          setTimeout(() => { downloadNotice?.hide(); downloadNotice = null; }, 2000);
+        }
+      },
     );
     this.wakeDetector.start();
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
