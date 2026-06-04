@@ -13,6 +13,10 @@
  */
 
 import * as ort from 'onnxruntime-web';
+// requestUrl is Obsidian's CORS-safe HTTP client — it operates at the OS /
+// Electron network level and is not subject to the CORS policy that blocks
+// window.fetch() when called from the app://obsidian.md origin.
+import { requestUrl } from 'obsidian';
 
 // Inlined at build time by esbuild define — contains the Emscripten JS glue
 // for ort-wasm-simd-threaded.mjs so no disk read is required at runtime.
@@ -307,13 +311,17 @@ export class WakeWordDetector {
       this.onProgress?.(`Downloading ${file}…`);
       if (this.debug) console.log(`[WakeWord] downloading ${file}`);
 
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`Failed to download ${file}: ${res.status} ${res.statusText}`);
+      // Use Obsidian's requestUrl — window.fetch() is blocked by CORS when
+      // called from the app://obsidian.md origin.  requestUrl() makes the
+      // request at the OS/Electron network level and follows redirects.
+      const res = await requestUrl({ url, method: 'GET' });
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`Failed to download ${file}: HTTP ${res.status}`);
+      }
 
-      const buf = await res.arrayBuffer();
-      fs.writeFileSync(dest, Buffer.from(buf));
+      fs.writeFileSync(dest, Buffer.from(res.arrayBuffer));
 
-      if (this.debug) console.log(`[WakeWord] saved ${file} (${(buf.byteLength / 1024).toFixed(0)} KB)`);
+      if (this.debug) console.log(`[WakeWord] saved ${file} (${(res.arrayBuffer.byteLength / 1024).toFixed(0)} KB)`);
     }
 
     this.onProgress?.('Loading models…');
