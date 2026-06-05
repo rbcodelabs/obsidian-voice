@@ -64,8 +64,14 @@ function makeMockAudioCtx(analyser: MockAnalyser) {
     state: 'running' as AudioContextState,
     resume: vi.fn(),
     close: vi.fn().mockResolvedValue(undefined),
+    // createMediaElementSource is used by the production code to tap the
+    // <audio> element's playback pipeline rather than the raw network stream.
+    createMediaElementSource: vi.fn().mockReturnValue(source),
+    // Keep createMediaStreamSource to avoid runtime errors if any code path
+    // still references it (and so the existing type is still satisfied).
     createMediaStreamSource: vi.fn().mockReturnValue(source),
     createAnalyser: vi.fn().mockReturnValue(analyser),
+    destination: {},
     _source: source,
   };
 }
@@ -157,7 +163,9 @@ function fireEvent(
 }
 
 function injectAudio(session: RealtimeSession, stream: MediaStream, audioCtx: ReturnType<typeof makeMockAudioCtx>) {
-  // Set the audioEl.srcObject to our fake stream
+  // Inject a minimal fake <audio> element. The production code now calls
+  // createMediaElementSource(audioEl) to tap the playback pipeline rather
+  // than createMediaStreamSource(stream), so we only need a truthy object here.
   const audioEl = { srcObject: stream, autoplay: true, style: { display: '' } };
   (session as unknown as Record<string, unknown>).audioEl = audioEl;
   // Pre-inject our mock AudioContext so it's not created via `new AudioContext()`
