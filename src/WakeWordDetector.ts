@@ -77,7 +77,7 @@ export class WakeWordDetector {
     onDetected: () => void,
     debug = false,
     threshold = DEFAULT_THRESHOLD,
-    private onProgress?: (msg: string) => void,
+    private onProgress?: (msg: string | null) => void,
   ) {
     this.modelDir = modelDir;
     this.onDetected = onDetected;
@@ -292,39 +292,46 @@ export class WakeWordDetector {
       { url: `${GH}/hey_obsidian.onnx`,             file: 'hey_obsidian.onnx',            minSize: 10_000    },
     ];
 
-    for (const { url, file, minSize } of assets) {
-      const dest = `${this.modelDir}/${file}`;
+    try {
+      for (const { url, file, minSize } of assets) {
+        const dest = `${this.modelDir}/${file}`;
 
-      // Size-based validation instead of existsSync: iCloud Drive can evict file
-      // data while leaving a placeholder entry that passes existsSync but causes
-      // ENOENT when readFileSync is called.  A non-zero size proves the bytes are
-      // actually present on disk.
-      const isUsable = (() => {
-        try { return fs.statSync(dest).size >= minSize; }
-        catch { return false; }
-      })();
-      if (isUsable) continue;
+        // Size-based validation instead of existsSync: iCloud Drive can evict file
+        // data while leaving a placeholder entry that passes existsSync but causes
+        // ENOENT when readFileSync is called.  A non-zero size proves the bytes are
+        // actually present on disk.
+        const isUsable = (() => {
+          try { return fs.statSync(dest).size >= minSize; }
+          catch { return false; }
+        })();
+        if (isUsable) continue;
 
-      // Remove any zero-byte iCloud placeholder before writing the fresh download.
-      try { fs.unlinkSync(dest); } catch { /* ignore — may not exist at all */ }
+        // Remove any zero-byte iCloud placeholder before writing the fresh download.
+        try { fs.unlinkSync(dest); } catch { /* ignore — may not exist at all */ }
 
-      this.onProgress?.(`Downloading ${file}…`);
-      if (this.debug) console.log(`[WakeWord] downloading ${file}`);
+        this.onProgress?.(`Downloading ${file}…`);
+        if (this.debug) console.log(`[WakeWord] downloading ${file}`);
 
-      // Use Obsidian's requestUrl — window.fetch() is blocked by CORS when
-      // called from the app://obsidian.md origin.  requestUrl() makes the
-      // request at the OS/Electron network level and follows redirects.
-      const res = await requestUrl({ url, method: 'GET' });
-      if (res.status < 200 || res.status >= 300) {
-        throw new Error(`Failed to download ${file}: HTTP ${res.status}`);
+        // Use Obsidian's requestUrl — window.fetch() is blocked by CORS when
+        // called from the app://obsidian.md origin.  requestUrl() makes the
+        // request at the OS/Electron network level and follows redirects.
+        const res = await requestUrl({ url, method: 'GET' });
+        if (res.status < 200 || res.status >= 300) {
+          throw new Error(`Failed to download ${file}: HTTP ${res.status}`);
+        }
+
+        fs.writeFileSync(dest, Buffer.from(res.arrayBuffer));
+
+        if (this.debug) console.log(`[WakeWord] saved ${file} (${(res.arrayBuffer.byteLength / 1024).toFixed(0)} KB)`);
       }
 
-      fs.writeFileSync(dest, Buffer.from(res.arrayBuffer));
-
-      if (this.debug) console.log(`[WakeWord] saved ${file} (${(res.arrayBuffer.byteLength / 1024).toFixed(0)} KB)`);
+      this.onProgress?.('Loading models…');
+    } catch (err) {
+      // Signal the caller that download failed so any in-progress notice can be
+      // dismissed immediately (null is the error sentinel).
+      this.onProgress?.(null);
+      throw err;
     }
-
-    this.onProgress?.('Loading models…');
   }
 
   /** Read a file from the local filesystem via Node.js fs (available in Electron). */
