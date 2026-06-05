@@ -57,8 +57,8 @@ export default class VoicePlugin extends Plugin {
   /** Called from the settings tab whenever wakeWordEnabled or wakeWord changes. */
   applyWakeWordSetting(): void {
     const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-    if (leaves.length > 0) {
-      (leaves[0].view as VoiceView).syncWakeWordDetector();
+    if (leaves.length > 0 && leaves[0].view instanceof VoiceView) {
+      leaves[0].view.syncWakeWordDetector();
     }
   }
 
