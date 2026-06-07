@@ -210,8 +210,14 @@ export class VoiceView extends ItemView {
       },
       debugLogging,
       this.plugin.settings.wakeWordThreshold,
-      (msg) => {
+      (msg: string | null) => {
         // Show a transient notice while assets download on first use.
+        if (msg === null) {
+          // Error during download — dismiss the notice immediately
+          downloadNotice?.hide();
+          downloadNotice = null;
+          return;
+        }
         if (!downloadNotice) downloadNotice = new Notice(msg, 0);
         else downloadNotice.setMessage(msg);
         if (msg === 'Loading models…') {
@@ -219,7 +225,14 @@ export class VoiceView extends ItemView {
         }
       },
     );
-    this.wakeDetector.start();
+    try {
+      this.wakeDetector.start();
+    } catch (err) {
+      (downloadNotice as Notice | null)?.hide();
+      downloadNotice = null;
+      new Notice('Voice: wake word model download failed — check your internet connection.');
+      console.error('[Voice] wake word start failed:', err);
+    }
     this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
   }
 
