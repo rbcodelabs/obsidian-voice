@@ -52,6 +52,9 @@ export class RealtimeSession {
   // response.output_audio.done / response.done fire when the server is done,
   // but audio may still be playing from the client-side WebRTC buffer.
   private audioCtxForAnalysis: AudioContext | null = null;
+  // Cached MediaElementAudioSourceNode — createMediaElementSource() can only
+  // be called once per element per AudioContext; we reuse this across responses.
+  private audioElementSource: MediaElementAudioSourceNode | null = null;
   private silenceWaitPending = false;
   // Guards against onAudioDone firing more than once per response.
   private audioDoneFired = false;
@@ -268,7 +271,7 @@ export class RealtimeSession {
       // Tool batch takes priority over notifications
       if (this.pendingToolCalls.length > 0) {
         const batch = this.pendingToolCalls.splice(0);
-        void this.flushToolBatch(batch, this.callbacks!);
+        void this.flushToolBatch(batch, callbacks);
         if (this.debug) console.debug('[Voice] response.done: → flushing tool batch');
         return;
       }
@@ -319,11 +322,17 @@ export class RealtimeSession {
   }
 
   /**
-   * Polls the WebRTC <audio> element's amplitude every 50 ms until the level
+   * Polls the <audio> element's playback amplitude every 50 ms until the level
    * stays below SILENCE_THRESHOLD for SILENCE_REQUIRED_MS, then fires
    * onAudioDone.  This correctly handles the gap between when the server says
    * "all audio bytes sent" (response.output_audio.done / response.done) and
    * when the client-side playback buffer actually drains.
+   *
+   * IMPORTANT: we tap the <audio> element via createMediaElementSource(), NOT
+   * the raw WebRTC stream via createMediaStreamSource().  The element source
+   * reflects what the audio renderer is actually outputting; the stream source
+   * only reflects what has arrived over the network and can go quiet while the
+   * browser's playback buffer still has seconds of audio left to play.
    *
    * Guards:
    *  - audioDoneFired: prevents double-firing per response
@@ -336,15 +345,18 @@ export class RealtimeSession {
     if (this.audioDoneFired || this.silenceWaitPending) return;
     this.silenceWaitPending = true;
 
-    const stream = this.audioEl?.srcObject as MediaStream | null;
-    if (!stream) {
-      // No audio stream yet — fire immediately (first-connect edge case)
+    if (!this.audioEl) {
+      // No audio element yet — fire immediately (first-connect edge case)
       this.silenceWaitPending = false;
       this.audioDoneFired = true;
-      if (this.debug) console.debug('[Voice] waitForAudioSilence: no stream → onAudioDone immediately');
+      if (this.debug) console.debug('[Voice] waitForAudioSilence: no audio element → onAudioDone immediately');
       callbacks.onAudioDone?.();
       return;
     }
+
+    // Log moment 1: network buffer receipt (caller already logged the event,
+    // but mark the start of our playback-end wait here for tracing).
+    console.log('[Voice] audio buffer received from network — waiting for playback to finish');
 
     if (!this.audioCtxForAnalysis) {
       this.audioCtxForAnalysis = new AudioContext();
@@ -352,19 +364,29 @@ export class RealtimeSession {
     const ctx = this.audioCtxForAnalysis;
     if (ctx.state === 'suspended') void ctx.resume();
 
-    let source: MediaStreamAudioSourceNode;
-    try {
-      source = ctx.createMediaStreamSource(stream);
-    } catch {
-      this.silenceWaitPending = false;
-      this.audioDoneFired = true;
-      callbacks.onAudioDone?.();
-      return;
+    // Use createMediaElementSource so we measure the audio element's actual
+    // decoder output, not the raw network stream.  createMediaElementSource
+    // can only be called once per element; reuse the cached node across
+    // responses and reconnect it to a fresh analyser each time.
+    if (!this.audioElementSource) {
+      try {
+        this.audioElementSource = ctx.createMediaElementSource(this.audioEl);
+        // Route through the context's destination so the audio still plays.
+        this.audioElementSource.connect(ctx.destination);
+      } catch {
+        // createMediaElementSource failed (e.g. in tests / unsupported env) —
+        // fall back to immediate fire so session state still advances.
+        this.audioElementSource = null;
+        this.silenceWaitPending = false;
+        this.audioDoneFired = true;
+        callbacks.onAudioDone?.();
+        return;
+      }
     }
 
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
-    source.connect(analyser);
+    this.audioElementSource.connect(analyser);
     const buf = new Float32Array(analyser.fftSize);
 
     const SILENCE_THRESHOLD  = 0.005; // RMS below this = silent
@@ -373,25 +395,34 @@ export class RealtimeSession {
     const TIMEOUT_MS = 30_000;
     const t0 = Date.now();
     let silenceMs = 0;
+    let playbackStartLogged = false;
 
-    if (this.debug) console.debug('[Voice] waitForAudioSilence: polling started');
+    if (this.debug) console.debug('[Voice] waitForAudioSilence: polling started (element source)');
 
     const check = () => {
       if (!this.silenceWaitPending) {
-        source.disconnect(); // cancelled by response.created or cleanup()
+        analyser.disconnect(); // cancelled by response.created or cleanup()
         return;
       }
       if (Date.now() - t0 > TIMEOUT_MS) {
         if (this.debug) console.debug('[Voice] waitForAudioSilence: timeout → onAudioDone');
-        source.disconnect();
+        analyser.disconnect();
         this.silenceWaitPending = false;
         this.audioDoneFired = true;
+        // Log moment 3: playback end (via timeout fallback)
+        console.log('[Voice] playback end detected (timeout fallback) — transitioning to silence');
         callbacks.onAudioDone?.();
         return;
       }
 
       analyser.getFloatTimeDomainData(buf);
       const rms = Math.sqrt(buf.reduce((s, v) => s + v * v, 0) / buf.length);
+
+      // Log moment 2: playback start (first tick where audio is actually playing)
+      if (!playbackStartLogged && rms >= SILENCE_THRESHOLD) {
+        playbackStartLogged = true;
+        console.log(`[Voice] playback start detected (rms=${rms.toFixed(4)})`);
+      }
 
       if (this.debug && silenceMs % 500 < CHECK_MS) {
         console.debug(`[Voice] waitForAudioSilence: rms=${rms.toFixed(4)} silenceMs=${silenceMs}`);
@@ -401,9 +432,11 @@ export class RealtimeSession {
         silenceMs += CHECK_MS;
         if (silenceMs >= SILENCE_REQUIRED_MS) {
           if (this.debug) console.debug(`[Voice] waitForAudioSilence: silence confirmed (rms=${rms.toFixed(4)}) → onAudioDone`);
-          source.disconnect();
+          analyser.disconnect();
           this.silenceWaitPending = false;
           this.audioDoneFired = true;
+          // Log moment 3: playback end (silence confirmed)
+          console.log(`[Voice] playback end detected — audio silent for ${SILENCE_REQUIRED_MS}ms, transitioning to silence`);
           callbacks.onAudioDone?.();
           return;
         }
@@ -547,6 +580,7 @@ export class RealtimeSession {
     // Cancel any running silence poll and release the AudioContext
     this.silenceWaitPending = false;
     this.audioDoneFired = false;
+    this.audioElementSource = null; // released when ctx closes
     if (this.audioCtxForAnalysis) {
       void this.audioCtxForAnalysis.close();
       this.audioCtxForAnalysis = null;
