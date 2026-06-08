@@ -43,11 +43,21 @@ const OWW_RESOURCES = path.join(
   '/opt/homebrew/lib/python3.14/site-packages/livekit/wakeword/resources',
 );
 
+// Committed model files used as fallback when local training paths are absent (e.g. CI).
+const MODELS_DIR = path.join(__dirname, 'models');
+
+function resolveModel(primaryPath, modelFile) {
+  if (fs.existsSync(primaryPath)) return primaryPath;
+  const fallback = path.join(MODELS_DIR, modelFile);
+  if (fs.existsSync(fallback)) return fallback;
+  return primaryPath; // let copyWakeWordAssets warn via its existsSync check
+}
+
 const WAKE_WORD_ASSETS = [
-  // Three-stage ONNX pipeline
-  { src: path.join(OWW_RESOURCES, 'melspectrogram.onnx'),   dest: 'melspectrogram.onnx'   },
-  { src: path.join(OWW_RESOURCES, 'embedding_model.onnx'),  dest: 'embedding_model.onnx'  },
-  { src: path.join(TRAINING_OUTPUT, 'hey_obsidian.onnx'),   dest: 'hey_obsidian.onnx'     },
+  // Three-stage ONNX pipeline — prefer local training output, fall back to models/
+  { src: resolveModel(path.join(OWW_RESOURCES, 'melspectrogram.onnx'),  'melspectrogram.onnx'),  dest: 'melspectrogram.onnx'  },
+  { src: resolveModel(path.join(OWW_RESOURCES, 'embedding_model.onnx'), 'embedding_model.onnx'), dest: 'embedding_model.onnx' },
+  { src: resolveModel(path.join(TRAINING_OUTPUT, 'hey_obsidian.onnx'),  'hey_obsidian.onnx'),    dest: 'hey_obsidian.onnx'    },
   // WASM runtime — both the binary and the Emscripten JS glue must be present
   // so onnxruntime-web can import them via file:// URLs (set via wasmPaths).
   { src: path.join(ORT_WASM_DIR, 'ort-wasm-simd-threaded.wasm'), dest: 'ort-wasm-simd-threaded.wasm' },

@@ -45,4 +45,7 @@ jobs:
             dist/main.js
             dist/manifest.json
             dist/styles.css
+            models/melspectrogram.onnx
+            models/embedding_model.onnx
+            models/hey_obsidian.onnx
           generate_release_notes: true
