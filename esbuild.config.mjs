@@ -7,28 +7,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isWatch = process.argv.includes('--watch');
 const outdir = path.join(__dirname, 'dist');
 
-// Load .env.local if present
-const envLocalPath = path.join(__dirname, '.env.local');
-if (fs.existsSync(envLocalPath)) {
-  for (const line of fs.readFileSync(envLocalPath, 'utf8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq < 1) continue;
-    const key = trimmed.slice(0, eq).trim();
-    const val = trimmed.slice(eq + 1).trim();
-    if (!(key in process.env)) process.env[key] = val;
-  }
-}
-
-const pluginDir = process.env.OBSIDIAN_PLUGIN_DIR;
-
-// Additional vaults to sync to (real copies, not symlinks)
-const extraVaults = [
-  path.join(process.env.HOME, 'projects/PluginTesting/.obsidian/plugins/obsidian-voice'),
-  path.join(process.env.HOME, 'Documents/Personal/.obsidian/plugins/obsidian-voice'),
-];
-
 if (!fs.existsSync(outdir)) fs.mkdirSync(outdir, { recursive: true });
 
 // ── Wake word ONNX / WASM assets ──────────────────────────────────────────
@@ -75,35 +53,9 @@ function copyWakeWordAssets(destDir) {
   }
 }
 
-function copyToObsidian() {
-  const dirs = [];
-  if (pluginDir) dirs.push(pluginDir);
-  for (const v of extraVaults) {
-    if (!fs.existsSync(v)) fs.mkdirSync(v, { recursive: true });
-    dirs.push(v);
-  }
-  for (const dir of dirs) {
-    for (const file of ['main.js', 'styles.css', 'manifest.json']) {
-      const src = path.join(outdir, file);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, file));
-    }
-    // Copy ONNX models and WASM runtime
-    copyWakeWordAssets(dir);
-    console.log(`Copied to ${dir}`);
-  }
-}
-
-const syncPlugin = {
-  name: 'obsidian-sync',
-  setup(build) {
-    build.onEnd(() => copyToObsidian());
-  },
-};
-
 const ctx = await esbuild.context({
   entryPoints: ['src/main.ts'],
   bundle: true,
-  plugins: [syncPlugin],
   // Force onnxruntime-web to use the WASM browser build instead of the
   // Node.js build (ort.node.min.mjs).  The Node build calls
   // createRequire(import.meta.url) at module init time; import.meta.url
@@ -169,7 +121,7 @@ copyWakeWordAssets(outdir);
 
 if (isWatch) {
   await ctx.watch();
-  console.log(`Watching for changes...${pluginDir ? ` (syncing to ${pluginDir})` : ' (set OBSIDIAN_PLUGIN_DIR to sync)'}`);
+  console.log('Watching for changes...');
 } else {
   await ctx.rebuild();
   await ctx.dispose();
