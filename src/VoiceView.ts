@@ -9,12 +9,56 @@ import { WakeWordDetector } from './WakeWordDetector';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
+/**
+ * Activity states for a live voice session. The countdown watchdog only runs
+ * in 'silence'. 'disconnect-pending' has its own short timer (3s default)
+ * driven by voiceDisconnectGraceSecs.
+ *
+ *   listening          connected, no turn in flight              no timer
+ *   user-speaking      between speech_started and speech_stopped no timer
+ *   ai-responding      between response.created and response.done no timer
+ *   tool-running       at least one tool call mid-execution      no timer
+ *   silence            fully idle                                silence countdown
+ *   disconnect-pending AI fired voice_disconnect tool            grace countdown
+ */
+export type SessionActivity =
+  | 'listening'
+  | 'user-speaking'
+  | 'ai-responding'
+  | 'tool-running'
+  | 'silence'
+  | 'disconnect-pending';
+
 const VOICE_CONTROL_TOOLS = [
   {
     type: 'function',
     name: 'voice_disconnect',
-    description: 'Disconnect the voice session. Use when the user says goodbye, asks to stop, or wants to end the conversation.',
-    parameters: { type: 'object', properties: {}, required: [] },
+    description:
+      'End the voice session. ONLY call this when the user has CLEARLY AND EXPLICITLY asked ' +
+      'to end the conversation. Clear requests look like: "end session", "goodbye obsidian", ' +
+      '"disconnect", "stop voice", "I am done". ' +
+      'DO NOT call this for filler words ("ok", "thanks", "alright", "hmm"), for pauses in the ' +
+      'conversation, for the user trailing off mid-thought, or for vague or implied endings. ' +
+      'If there is ANY chance the user wants to keep talking, do NOT call this — keep the ' +
+      'conversation going. You must provide both a reason and the exact phrase you heard.',
+    parameters: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description:
+            'One short sentence explaining why you are ending the session ' +
+            '(e.g. "User said goodbye and asked to end the session").',
+        },
+        phrase: {
+          type: 'string',
+          description:
+            'The exact words the user said that you interpret as ending the session, verbatim. ' +
+            'Do not paraphrase.',
+        },
+      },
+      required: ['reason', 'phrase'],
+    },
   },
   {
     type: 'function',
@@ -50,12 +94,27 @@ export class VoiceView extends ItemView {
   // Wake word
   private wakeDetector: WakeWordDetector | null = null;
 
+  // Silence watchdog — only runs while sessionActivity === 'silence'.
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private countdownInterval: ReturnType<typeof setInterval> | null = null;
-
-  // Real-time session activity — drives the status label while connected
-  private sessionActivity: 'listening' | 'user-speaking' | 'ai-responding' | 'silence' = 'listening';
   private silenceSecsLeft = 0;
+
+  // Real-time session activity — drives the status label and the timer.
+  // All transitions route through transitionTo(); never assign directly.
+  private sessionActivity: SessionActivity = 'listening';
+
+  // Disconnect-pending state — driven by the voice_disconnect tool. Independent
+  // of the silence watchdog so the AI can request a disconnect even while the
+  // silence countdown was disabled (silenceTimeoutSecs=0).
+  private disconnectPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  private disconnectPendingInterval: ReturnType<typeof setInterval> | null = null;
+  private disconnectPendingSecsLeft = 0;
+  // The transcript event UI for an active disconnect-pending state, kept so
+  // we can update its countdown text and replace it on abort.
+  private disconnectPendingEl: HTMLElement | null = null;
+  // Captured for telemetry and the abort message back to the model.
+  private disconnectPendingReason = '';
+  private disconnectPendingPhrase = '';
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -135,6 +194,7 @@ export class VoiceView extends ItemView {
 
   async onClose(): Promise<void> {
     this.clearSilenceTimer();
+    this.clearDisconnectPendingTimer();
     this.wakeDetector?.stop();
     this.wakeDetector = null;
     this.session?.disconnect();
@@ -279,12 +339,14 @@ export class VoiceView extends ItemView {
         this.updateStatus(status);
         if (status === 'connected') {
           this.isConnected = true;
-          this.sessionActivity = 'listening';
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Disconnect';
           this.playChime('connect');
-          // Start the silence watchdog — resets on any user/assistant activity
-          this.resetSilenceTimer();
+          // Enter 'listening' with NO silence countdown. The countdown only
+          // arms once a turn actually completes (onSpeechStopped or onAudioDone).
+          // Previously this called resetSilenceTimer() and would disconnect a
+          // user who took >silenceTimeoutSecs to start talking.
+          this.transitionTo('listening', 'connected');
           // Wire notification bridge now that session is live
           if (this.notificationBridge && this.session) {
             const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
@@ -312,6 +374,13 @@ export class VoiceView extends ItemView {
           this.isConnected = false;
           this.connectBtn.disabled = false;
           this.connectBtn.textContent = 'Connect';
+          // Tear down both watchdog timers so they can't fire after the
+          // session is gone (e.g. network drop while in disconnect-pending).
+          this.clearSilenceTimer();
+          this.clearDisconnectPendingTimer();
+          this.disconnectPendingEl = null;
+          this.disconnectPendingReason = '';
+          this.disconnectPendingPhrase = '';
           if (wasConnected) this.playChime('disconnect');
           this.notificationBridge?.disconnect();
           this.notificationBridge = null;
@@ -321,29 +390,44 @@ export class VoiceView extends ItemView {
         }
       },
       onSpeechStarted: () => {
-        this.sessionActivity = 'user-speaking';
-        this.clearSilenceTimer();
-        this.refreshConnectedStatus();
+        // User started talking. If we were in disconnect-pending, treat this
+        // as an implicit "stay connected" — the user clearly isn't done.
+        if (this.sessionActivity === 'disconnect-pending') {
+          this.cancelDisconnectPending('user_resumed_speaking', /* injectMessage */ false);
+        }
+        this.transitionTo('user-speaking', 'speech_started');
       },
       onSpeechStopped: () => {
-        // User finished — wait for AI to pick up; resetSilenceTimer sets
-        // activity to 'silence' and starts the countdown.
-        this.resetSilenceTimer();
+        // Server VAD says the user stopped. We don't know yet whether the AI
+        // will respond, so enter 'silence' with the configured countdown.
+        // (Brief mid-sentence pauses re-trigger speech_started, which clears
+        // the countdown again, so this is safe.)
+        this.transitionTo('silence', 'speech_stopped');
       },
       onResponseStarted: () => {
-        this.sessionActivity = 'ai-responding';
-        this.clearSilenceTimer();
-        this.refreshConnectedStatus();
+        // New response from the server. If we were in disconnect-pending
+        // (e.g. the AI is producing its goodbye message), don't change state
+        // — the grace timer is the only thing that can complete that path.
+        if (this.sessionActivity === 'disconnect-pending') return;
+        this.transitionTo('ai-responding', 'response.created');
       },
       onAudioDone: () => {
-        // AI finished streaming audio — genuine silence begins now.
-        this.resetSilenceTimer();
+        // AI finished playing audio. Only transition to 'silence' from
+        // 'ai-responding' — if we're in tool-running, an audio_done from
+        // the AI's pre-tool preamble (e.g. "Let me check...") should not
+        // arm the watchdog while the tool is still executing.
+        if (this.sessionActivity === 'tool-running' || this.sessionActivity === 'disconnect-pending') return;
+        this.transitionTo('silence', 'audio_done');
       },
       onTranscript: (role, text, done) => {
         this.handleTranscript(role, text, done);
       },
       onToolCall: (callId, name, argsJson) => {
-        this.resetSilenceTimer(); // tool activity also counts as interaction
+        // Tool calls are NOT silence-triggering events. Enter 'tool-running'
+        // with no countdown — the tool itself may run for 30–120s. The next
+        // response.created (after flushToolBatch sends response.create) will
+        // transition us out to 'ai-responding'.
+        this.transitionTo('tool-running', `tool_call:${name}`);
         const label = this.formatToolLabel(name, argsJson);
         const el = this.addToolEvent(label);
         this.pendingToolEls.set(callId, el);
@@ -361,8 +445,13 @@ export class VoiceView extends ItemView {
         }
         let result: string;
         if (name === 'voice_disconnect') {
-          result = 'Disconnecting voice session.';
-          setTimeout(() => this.doDisconnect(), 3000);
+          // Don't disconnect immediately. Enter 'disconnect-pending' which
+          // shows a visible abort UI for voiceDisconnectGraceSecs. The user
+          // can click "Stay connected" or just start speaking to cancel.
+          const reason = String(args.reason ?? '').trim() || '(no reason given)';
+          const phrase = String(args.phrase ?? '').trim() || '(no phrase captured)';
+          this.startDisconnectPending(reason, phrase);
+          result = `Disconnect requested. The user has ${this.plugin.settings.voiceDisconnectGraceSecs} seconds to cancel by clicking Stay or speaking. Reason: "${reason}". Phrase heard: "${phrase}".`;
         } else if (name === 'voice_wait') {
           const secs = Math.min(Math.max(1, Number(args.seconds) || 5), 300);
           await new Promise((r) => setTimeout(r, secs * 1000));
@@ -383,17 +472,55 @@ export class VoiceView extends ItemView {
     }, allTools, this.plugin.settings.debugLogging);
   }
 
-  /** Start (or restart) the inactivity watchdog using the current setting. No-op if timeout is 0. */
-  private resetSilenceTimer(): void {
+  /**
+   * Single entry point for session-activity state transitions. Always route
+   * through this method — never assign sessionActivity directly. Handles:
+   *   1. Lifecycle logging — every transition is recorded with a reason so
+   *      future complaints can be diagnosed from a console capture alone.
+   *   2. Tearing down the timer of the previous state.
+   *   3. Arming the timer of the next state (silence countdown, disconnect-
+   *      pending grace timer).
+   *   4. Refreshing the status bar.
+   *
+   * Transitions are idempotent except 'silence' (re-arms the countdown) and
+   * 'disconnect-pending' (which is handled separately via startDisconnectPending).
+   */
+  protected transitionTo(next: SessionActivity, reason: string): void {
+    const prev = this.sessionActivity;
+    // Re-entering 'silence' is meaningful — it restarts the countdown.
+    if (prev === next && next !== 'silence') {
+      // Still log the no-op so we can see what triggered it during debugging.
+      console.debug(`[Voice/lifecycle] (no-op) ${prev} → ${next} (${reason})`);
+      return;
+    }
+
+    console.log(`[Voice/lifecycle] ${prev} → ${next} (${reason})`);
+    this.sessionActivity = next;
+
+    // Tear down the silence timer regardless of target state. Only 'silence'
+    // arms it again below.
     this.clearSilenceTimer();
+
+    if (next === 'silence') {
+      this.armSilenceCountdown();
+    }
+    // disconnect-pending timer is owned by startDisconnectPending/cancelDisconnectPending.
+
+    this.refreshConnectedStatus();
+  }
+
+  /**
+   * Arm the silence countdown using the configured silenceTimeoutSecs. No-op
+   * when the user has disabled it (0). Called only from transitionTo() when
+   * entering 'silence'.
+   */
+  private armSilenceCountdown(): void {
     const secs = this.plugin.settings.silenceTimeoutSecs;
     if (!secs) return; // 0 = disabled
 
-    this.sessionActivity = 'silence';
     this.silenceSecsLeft = secs;
     this.refreshConnectedStatus();
 
-    // Tick every second to keep the countdown live in the status bar
     this.countdownInterval = setInterval(() => {
       this.silenceSecsLeft = Math.max(0, this.silenceSecsLeft - 1);
       this.refreshConnectedStatus();
@@ -402,6 +529,7 @@ export class VoiceView extends ItemView {
     this.silenceTimer = setTimeout(() => {
       if (!this.isConnected) return;
       this.clearCountdownInterval();
+      console.log(`[Voice/lifecycle] silence → idle (silence_timeout:${secs}s)`);
       this.addToolEvent(
         `Disconnected after ${secs}s of silence — say "hey obsidian" to reconnect`
       );
@@ -424,6 +552,146 @@ export class VoiceView extends ItemView {
     }
   }
 
+  /**
+   * Enter 'disconnect-pending' state with a visible abort UI. Called when
+   * the AI fires the voice_disconnect tool.
+   */
+  protected startDisconnectPending(reason: string, phrase: string): void {
+    const grace = Math.min(30, Math.max(1, this.plugin.settings.voiceDisconnectGraceSecs || 3));
+    this.disconnectPendingReason = reason;
+    this.disconnectPendingPhrase = phrase;
+
+    console.log(`[Voice/lifecycle] ${this.sessionActivity} → disconnect-pending (voice_disconnect reason="${reason}" phrase="${phrase}" grace=${grace}s)`);
+    this.sessionActivity = 'disconnect-pending';
+
+    // Wipe any silence timer so two countdowns don't race.
+    this.clearSilenceTimer();
+    this.clearDisconnectPendingTimer();
+    this.disconnectPendingSecsLeft = grace;
+
+    // Render the abort UI as a transcript event with a button.
+    const el = this.createDisconnectPendingEl(reason, phrase, grace);
+    this.disconnectPendingEl = el;
+    this.refreshConnectedStatus();
+
+    this.disconnectPendingInterval = setInterval(() => {
+      this.disconnectPendingSecsLeft = Math.max(0, this.disconnectPendingSecsLeft - 1);
+      this.updateDisconnectPendingEl();
+      this.refreshConnectedStatus();
+    }, 1000);
+
+    this.disconnectPendingTimer = setTimeout(() => {
+      if (!this.isConnected) return;
+      console.log(`[Voice/lifecycle] disconnect-pending → idle (grace_expired reason="${reason}")`);
+      this.clearDisconnectPendingTimer();
+      this.markDisconnectPendingEl('Disconnected.');
+      this.addToolEvent(`Disconnected by AI · reason: "${reason}"`);
+      this.doDisconnect();
+    }, grace * 1000);
+  }
+
+  /**
+   * Abort a pending disconnect. Triggered by the Stay button, by the user
+   * speaking again, or programmatically (tests, future hooks).
+   *
+   * When triggered by the Stay button, we send a message back to the model
+   * so it knows the user changed their mind. When triggered by speech, we
+   * skip the inject — the user's voice IS the next message.
+   */
+  protected cancelDisconnectPending(via: string, injectMessage: boolean): void {
+    if (this.sessionActivity !== 'disconnect-pending') return;
+    const reason = this.disconnectPendingReason;
+    console.log(`[Voice/lifecycle] disconnect-pending → listening (cancelled via=${via} original_reason="${reason}")`);
+
+    this.clearDisconnectPendingTimer();
+    this.markDisconnectPendingEl(via === 'stay_button'
+      ? 'Stayed connected.'
+      : via === 'user_resumed_speaking'
+        ? 'User resumed speaking — stayed connected.'
+        : 'Disconnect cancelled.');
+
+    if (injectMessage && this.session) {
+      // Use injectUserMessage so an in-flight "OK, goodbye!" response is
+      // cancelled cleanly before the model sees the cancellation.
+      void this.session.injectUserMessage(
+        'I clicked Stay connected. Please continue the conversation — I did not mean to end the session.'
+      );
+    }
+
+    // Don't immediately re-arm a silence countdown; transitionTo will land us
+    // in 'listening' which has no countdown. The next speech_stopped or
+    // audio_done event will arm normally.
+    this.disconnectPendingReason = '';
+    this.disconnectPendingPhrase = '';
+    this.disconnectPendingEl = null;
+    this.transitionTo('listening', `disconnect_cancelled:${via}`);
+  }
+
+  private clearDisconnectPendingTimer(): void {
+    if (this.disconnectPendingTimer !== null) {
+      clearTimeout(this.disconnectPendingTimer);
+      this.disconnectPendingTimer = null;
+    }
+    if (this.disconnectPendingInterval !== null) {
+      clearInterval(this.disconnectPendingInterval);
+      this.disconnectPendingInterval = null;
+    }
+  }
+
+  /** Build the abort UI: panel notice with countdown text + Stay button. */
+  private createDisconnectPendingEl(reason: string, phrase: string, grace: number): HTMLElement {
+    const wrapper = this.transcriptContainer.createDiv({ cls: 'voice-disconnect-pending' });
+    wrapper.createDiv({
+      cls: 'voice-disconnect-pending__title',
+      text: 'AI requested to end the session',
+    });
+    wrapper.createDiv({
+      cls: 'voice-disconnect-pending__meta',
+      text: `Reason: ${reason}`,
+    });
+    if (phrase && phrase !== '(no phrase captured)') {
+      wrapper.createDiv({
+        cls: 'voice-disconnect-pending__meta',
+        text: `Heard: "${phrase}"`,
+      });
+    }
+    const countdownEl = wrapper.createDiv({
+      cls: 'voice-disconnect-pending__countdown',
+      text: `Disconnecting in ${grace}s…`,
+    });
+    countdownEl.dataset.role = 'countdown';
+    const btn = wrapper.createEl('button', {
+      cls: 'voice-disconnect-pending__stay-btn',
+      text: 'Stay connected',
+    });
+    btn.addEventListener('click', () => {
+      this.cancelDisconnectPending('stay_button', /* injectMessage */ true);
+    });
+    this.scrollToBottom();
+    return wrapper;
+  }
+
+  /** Update the countdown text inside the active abort UI. */
+  private updateDisconnectPendingEl(): void {
+    if (!this.disconnectPendingEl) return;
+    const countdownEl = this.disconnectPendingEl.querySelector('[data-role="countdown"]');
+    if (countdownEl) {
+      countdownEl.textContent = `Disconnecting in ${this.disconnectPendingSecsLeft}s…`;
+    }
+  }
+
+  /** Freeze the abort UI to a final state (no button, no countdown). */
+  private markDisconnectPendingEl(finalText: string): void {
+    if (!this.disconnectPendingEl) return;
+    const btn = this.disconnectPendingEl.querySelector('.voice-disconnect-pending__stay-btn');
+    btn?.remove();
+    const countdownEl = this.disconnectPendingEl.querySelector('[data-role="countdown"]') as HTMLElement | null;
+    if (countdownEl) {
+      countdownEl.textContent = finalText;
+      countdownEl.classList.add('voice-disconnect-pending__countdown--final');
+    }
+  }
+
   /** Re-render the status label without changing the session status. */
   private refreshConnectedStatus(): void {
     if (this.isConnected) this.updateStatus('connected');
@@ -431,6 +699,10 @@ export class VoiceView extends ItemView {
 
   private doDisconnect(): void {
     this.clearSilenceTimer();
+    this.clearDisconnectPendingTimer();
+    this.disconnectPendingEl = null;
+    this.disconnectPendingReason = '';
+    this.disconnectPendingPhrase = '';
     if (this.isConnected) this.playChime('disconnect');
     this.session?.disconnect();
     this.session = null;
@@ -555,17 +827,22 @@ export class VoiceView extends ItemView {
 
     const connectedLabel = (): string => {
       switch (this.sessionActivity) {
-        case 'user-speaking':  return 'You\'re speaking…';
-        case 'ai-responding':  return 'AI responding…';
-        case 'silence':        return `Silence — ${this.silenceSecsLeft}s`;
-        default:               return 'Connected';
+        case 'user-speaking':       return 'You\'re speaking…';
+        case 'ai-responding':       return 'AI responding…';
+        case 'tool-running':        return 'AI working…';
+        case 'silence':             return `Silence — ${this.silenceSecsLeft}s`;
+        case 'disconnect-pending':  return `Disconnecting in ${this.disconnectPendingSecsLeft}s · click Stay`;
+        case 'listening':           return 'Listening';
+        default:                    return 'Connected';
       }
     };
     const connectedDot = (): string => {
       switch (this.sessionActivity) {
-        case 'user-speaking': return 'voice-status__dot--listening';  // accent pulse
-        case 'ai-responding': return 'voice-status__dot--connecting'; // yellow pulse
-        default:              return 'voice-status__dot--connected';   // static green
+        case 'user-speaking':       return 'voice-status__dot--listening';  // accent pulse
+        case 'ai-responding':       return 'voice-status__dot--connecting'; // yellow pulse
+        case 'tool-running':        return 'voice-status__dot--connecting'; // yellow pulse (still busy)
+        case 'disconnect-pending':  return 'voice-status__dot--error';      // red — about to disconnect
+        default:                    return 'voice-status__dot--connected';   // static green
       }
     };
 
@@ -707,7 +984,7 @@ export class VoiceView extends ItemView {
           ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}…`
           : 'Stopped watching all threads…';
       case 'voice_disconnect':
-        return 'Disconnecting…';
+        return 'Disconnect requested…';
       case 'voice_wait':
         return `Waiting ${Number(args.seconds) || 5}s…`;
       default:
@@ -790,7 +1067,7 @@ export class VoiceView extends ItemView {
             ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}`
             : 'Stopped all notifications';
       case 'voice_disconnect':
-        return 'Disconnecting…';
+        return 'Disconnect requested · awaiting grace period';
       case 'voice_wait':
         return result;
       default:

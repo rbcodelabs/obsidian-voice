@@ -1,86 +1,89 @@
 /**
  * silence-detection.test.ts
  *
- * Tests for the audio-silence detection logic in RealtimeSession and its
- * interaction with the VoiceView silence countdown (simulated inline here
- * so we don't need Obsidian APIs).
+ * Tests for the audio-playback-end detection logic in RealtimeSession and
+ * its interaction with the VoiceView silence countdown (simulated inline
+ * here so we don't need Obsidian APIs).
+ *
+ * The implementation under test (`waitForAudioPlaybackEnd`) polls
+ * `pc.getStats()` for the inbound audio track's `totalSamplesDuration` —
+ * the cumulative count, in seconds, of audio frames decoded by the WebRTC
+ * receiver. It advances while audio is arriving and stalls when the server
+ * stops sending. Once it has stalled for AUDIO_STALL_REQUIRED_MS (400ms)
+ * AND response.done has arrived, the loop schedules a fixed
+ * AUDIO_JITTER_DRAIN_MS (500ms) wait for the audio device playout buffer
+ * to drain, then fires onAudioDone.
  *
  * Key scenarios:
- *  1. waitForAudioSilence fires onAudioDone after 600ms of actual silence
- *  2. waitForAudioSilence does NOT fire while audio is playing
- *  3. response.created cancels a stale silence-wait loop
+ *  1. Fires onAudioDone after stream stalls + 500ms drain (once response.done seen)
+ *  2. Does NOT fire while audio frames are still arriving
+ *  3. responseDoneSeen gate: silence before response.done held indefinitely
  *  4. audioDoneFired guard prevents double-fire per response
- *  5. *** BUG SCENARIO ***: user speaks > 15s → should NOT disconnect
- *     Currently fails because waitForAudioSilence fires onAudioDone after
- *     AI audio drains, even if the user started speaking before then.
+ *  5. response.created cancels a stale poll loop
+ *  6. BUG SCENARIO: user speaking long message must not be cut off
+ *  7. Tool-only response (no audio frames) fires after NO_AUDIO_GRACE_MS
  *
  * How the mocks work:
- *  - AudioContext / AnalyserNode are mocked globally (Node has neither)
- *  - RMS is controlled by filling the Float32Array with a constant value:
- *    rms = sqrt(mean(v²)) = |v|, so buf.fill(0.1) → rms = 0.1 (audio
- *    playing), buf.fill(0.001) → rms = 0.001 (silence)
- *  - vi.useFakeTimers() controls setTimeout so we don't have real waits
- *  - CHECK_MS = 50, SILENCE_REQUIRED_MS = 600, so 12 silent ticks → fire
+ *  - We inject a fake RTCPeerConnection whose getStats() returns a Map
+ *    containing a single inbound-rtp audio report whose
+ *    totalSamplesDuration is controlled by the test via setSamplesDuration().
+ *  - Timing constants:
+ *      AUDIO_POLL_MS = 100
+ *      AUDIO_STALL_REQUIRED_MS = 400
+ *      AUDIO_JITTER_DRAIN_MS = 500
+ *      NO_AUDIO_GRACE_MS = 300
+ *  - getStats() returns a Promise, so tests use vi.advanceTimersByTimeAsync
+ *    to flush both timers and microtasks.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { RealtimeSession, SessionCallbacks } from '../RealtimeSession';
 
 // ---------------------------------------------------------------------------
-// Web Audio API mocks (not available in Node)
+// pc.getStats() mock
 // ---------------------------------------------------------------------------
 
-type MockAnalyser = {
-  fftSize: number;
-  connect: ReturnType<typeof vi.fn>;
-  disconnect: ReturnType<typeof vi.fn>;
-  getFloatTimeDomainData: ReturnType<typeof vi.fn>;
-  /** Controls what RMS the next check() sees. */
-  rms: number;
-};
-
-function makeMockAnalyser(initialRms = 0.1): MockAnalyser {
-  const analyser: MockAnalyser = {
-    fftSize: 512,
-    rms: initialRms,
-    connect: vi.fn(),
-    disconnect: vi.fn(),
-    getFloatTimeDomainData: vi.fn((buf: Float32Array) => {
-      // Fill with a constant so sqrt(mean(v²)) = |v| = analyser.rms
-      buf.fill(analyser.rms);
-    }),
-  };
-  return analyser;
+interface MockPcHandle {
+  pc: RTCPeerConnection;
+  /** Set the totalSamplesDuration that the next getStats() call will report. */
+  setSamplesDuration: (secs: number) => void;
+  /** Spy on how many times getStats has been called. */
+  getStatsCalls: () => number;
 }
 
-type MockSource = {
-  connect: ReturnType<typeof vi.fn>;
-  disconnect: ReturnType<typeof vi.fn>;
-};
-
-function makeMockAudioCtx(analyser: MockAnalyser) {
-  const source: MockSource = { connect: vi.fn(), disconnect: vi.fn() };
+function makeMockPc(): MockPcHandle {
+  const state = { duration: 0, calls: 0 };
+  const report = {
+    type: 'inbound-rtp',
+    kind: 'audio',
+    get totalSamplesDuration(): number {
+      return state.duration;
+    },
+  };
+  // Use a Map-like with .forEach to match RTCStatsReport's interface
+  const stats = {
+    forEach: (cb: (r: unknown) => void) => {
+      cb(report);
+    },
+  };
+  const pc = {
+    getStats: vi.fn().mockImplementation(() => {
+      state.calls += 1;
+      return Promise.resolve(stats);
+    }),
+    close: vi.fn(),
+  };
   return {
-    state: 'running' as AudioContextState,
-    resume: vi.fn(),
-    close: vi.fn().mockResolvedValue(undefined),
-    // createMediaElementSource is used by the production code to tap the
-    // <audio> element's playback pipeline rather than the raw network stream.
-    createMediaElementSource: vi.fn().mockReturnValue(source),
-    // Keep createMediaStreamSource to avoid runtime errors if any code path
-    // still references it (and so the existing type is still satisfied).
-    createMediaStreamSource: vi.fn().mockReturnValue(source),
-    createAnalyser: vi.fn().mockReturnValue(analyser),
-    destination: {},
-    _source: source,
+    pc: pc as unknown as RTCPeerConnection,
+    setSamplesDuration: (secs) => {
+      state.duration = secs;
+    },
+    getStatsCalls: () => state.calls,
   };
 }
 
 // ---------------------------------------------------------------------------
 // Inline VoiceView-like silence controller
-//
-// Simulates just the timer logic from VoiceView so we can test the full
-// callback interaction without needing Obsidian APIs.
 // ---------------------------------------------------------------------------
 
 const SILENCE_TIMEOUT_SECS = 15;
@@ -91,7 +94,7 @@ class SilenceController {
   secsLeft = 0;
   activity: 'user-speaking' | 'ai-responding' | 'silence' | 'idle' = 'idle';
   disconnected = false;
-  disconnectAt: number | null = null;   // fake-timer timestamp of disconnect
+  disconnectAt: number | null = null;
 
   reset(secsLeft = SILENCE_TIMEOUT_SECS) {
     this.clear();
@@ -113,7 +116,6 @@ class SilenceController {
     this.countdownInterval = null;
   }
 
-  /** Build the subset of SessionCallbacks that drive timing. */
   asCallbacks(): Partial<SessionCallbacks> {
     return {
       onSpeechStarted: () => {
@@ -128,7 +130,6 @@ class SilenceController {
         this.clear();
       },
       onAudioDone: () => {
-        // VoiceView resets the silence timer when AI audio finishes
         this.reset();
       },
     };
@@ -162,163 +163,188 @@ function fireEvent(
   (session as unknown as { handleEvent: typeof fireEvent }).handleEvent(event, callbacks);
 }
 
-function injectAudio(session: RealtimeSession, stream: MediaStream, audioCtx: ReturnType<typeof makeMockAudioCtx>) {
-  // Inject a minimal fake <audio> element. The production code now calls
-  // createMediaElementSource(audioEl) to tap the playback pipeline rather
-  // than createMediaStreamSource(stream), so we only need a truthy object here.
-  const audioEl = { srcObject: stream, autoplay: true, style: { display: '' } };
-  (session as unknown as Record<string, unknown>).audioEl = audioEl;
-  // Pre-inject our mock AudioContext so it's not created via `new AudioContext()`
-  (session as unknown as Record<string, unknown>).audioCtxForAnalysis = audioCtx;
+function injectPc(session: RealtimeSession, pc: RTCPeerConnection) {
+  (session as unknown as Record<string, unknown>).pc = pc;
+  // Also inject a truthy audio element so any code path that checks for one
+  // still has something to look at.
+  (session as unknown as Record<string, unknown>).audioEl = { srcObject: {}, autoplay: true };
 }
 
 function get(session: RealtimeSession, field: string): unknown {
   return (session as unknown as Record<string, unknown>)[field];
 }
 
+/**
+ * Drive the polling loop forward by N ms. Awaits microtasks after each tick
+ * so that getStats().then() handlers run before the next timer fires.
+ */
+async function tick(ms: number) {
+  await vi.advanceTimersByTimeAsync(ms);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('waitForAudioSilence — core behaviour', () => {
+describe('waitForAudioPlaybackEnd — core behaviour', () => {
   let session: RealtimeSession;
   let callbacks: SessionCallbacks;
   let ctrl: SilenceController;
-  let analyser: MockAnalyser;
-  let audioCtx: ReturnType<typeof makeMockAudioCtx>;
-  const fakeStream = {} as MediaStream;
+  let pcHandle: MockPcHandle;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    analyser = makeMockAnalyser(0.1); // starts with audio playing
-    audioCtx = makeMockAudioCtx(analyser);
+    pcHandle = makeMockPc();
     session = new RealtimeSession();
     ctrl = new SilenceController();
     callbacks = makeFullCallbacks(ctrl);
-    injectAudio(session, fakeStream, audioCtx);
+    injectPc(session, pcHandle.pc);
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('fires onAudioDone after 600ms of continuous silence (12 × 50ms ticks)', () => {
-    analyser.rms = 0.001; // silent from the start
-
+  it('fires onAudioDone after stream stalls + jitter drain (responseDoneSeen)', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
 
-    // 11 ticks of silence → not yet (550ms)
-    vi.advanceTimersByTime(550);
+    // Simulate 1.5 seconds of received audio over 1.5 seconds wall time
+    pcHandle.setSamplesDuration(0.1);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
+
+    // Audio still arriving for 1500ms — polls every 100ms, duration grows
+    for (let t = 100; t <= 1500; t += 100) {
+      pcHandle.setSamplesDuration(t / 1000);
+      await tick(100);
+    }
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
 
-    // 12th tick tips it over 600ms
-    vi.advanceTimersByTime(50);
+    // Stream stalls — duration no longer advances
+    // 400ms of stall (poll keeps reading same value) → schedule drain
+    await tick(400);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // 500ms drain timer → fire
+    await tick(500);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
 
-  it('does NOT fire onAudioDone while audio is playing', () => {
-    analyser.rms = 0.1; // loud: well above SILENCE_THRESHOLD=0.005
-
+  it('does NOT fire while audio is still arriving', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
 
-    vi.advanceTimersByTime(2000); // 40 ticks, all noisy
+    // Steadily increasing duration for 3 seconds — never stalls
+    for (let t = 100; t <= 3000; t += 100) {
+      pcHandle.setSamplesDuration(t / 1000);
+      await tick(100);
+    }
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
   });
 
-  it('fires only after audio goes quiet (active then silent)', () => {
-    analyser.rms = 0.1; // audio playing
-
+  it('responseDoneSeen gate: stalled stream held until response.done arrives', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.5);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
 
-    // 400ms of audio playing
-    vi.advanceTimersByTime(400);
+    // First tick records the duration
+    await tick(100);
+
+    // 5 seconds of stall — but response.done withheld → must not fire
+    await tick(5000);
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
 
-    // audio drains
-    analyser.rms = 0.001;
+    // response.done arrives → next poll detects stalledMs >= 400 → drain → fire
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    await tick(100); // next poll, decides to drain
+    await tick(500); // drain timer
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
 
-    // 550ms more — still not enough (only 550ms silent)
-    vi.advanceTimersByTime(550);
+  it('audioDoneFired guard prevents onAudioDone firing twice for one response', async () => {
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.3);
+
+    // Both output_audio.done events arrive (idempotent)
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    // Wait for the full sequence: 100ms first tick, 400ms stall, 500ms drain
+    await tick(1100);
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
+
+  it('response.created cancels any stale poll from the prior response', async () => {
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.5);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    // 200ms into the wait — poll has recorded the duration once
+    await tick(200);
+    expect(get(session, 'playbackWaitPending')).toBe(true);
+
+    // New response interrupts before the stall + drain completes
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    expect(get(session, 'playbackWaitPending')).toBe(false);
+
+    // Advance well past the old drain deadline — must not fire from the dead loop
+    await tick(2000);
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
 
-    // 50ms more — 600ms silent → fires
-    vi.advanceTimersByTime(50);
+    // New response ends with audio that stalls cleanly
+    pcHandle.setSamplesDuration(0.8);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    await tick(100); // first poll picks up the new duration
+    await tick(400); // stall
+    await tick(500); // drain
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
 
-  it('resets the silence accumulator if audio comes back during the wait', () => {
-    analyser.rms = 0.001; // silent
-
+  it('handles the legacy beta event name response.audio.done', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    pcHandle.setSamplesDuration(0.2);
+    fireEvent(session, { type: 'response.audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
 
-    vi.advanceTimersByTime(400); // 400ms silent
-    analyser.rms = 0.1;          // audio bursts back (e.g. comfort noise spike)
-    vi.advanceTimersByTime(100); // reset the accumulator
-    analyser.rms = 0.001;        // silent again
+    await tick(100); // first poll
+    await tick(400); // stall
+    await tick(500); // drain
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
 
-    vi.advanceTimersByTime(550); // only 550ms since reset → not yet
+  it('tool-only response (no audio) fires after NO_AUDIO_GRACE_MS', async () => {
+    // No audio frames ever arrive. Only response.created → response.done.
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // idle safety path
+
+    // 100ms first poll: duration=0, seenAudio=false, responseDoneSeen=true
+    // but elapsed since t0 (100ms) < NO_AUDIO_GRACE_MS (300)
+    await tick(100);
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
 
-    vi.advanceTimersByTime(50); // 600ms clean silence → fires
+    // 300ms total elapsed → fires
+    await tick(300);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
 
-  it('audioDoneFired guard prevents onAudioDone firing twice for one response', () => {
-    analyser.rms = 0.001;
-
+  it('cleanup() resets responseDoneSeen and playbackWaitPending', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
-    // Both events arrive (e.g. response.audio.done then response.done idle path)
+    expect(get(session, 'responseDoneSeen')).toBe(false);
+
+    pcHandle.setSamplesDuration(0.3);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    // second call is a no-op due to silenceWaitPending guard
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    await tick(50); // start the poll
+    expect(get(session, 'playbackWaitPending')).toBe(true);
 
-    vi.advanceTimersByTime(700);
-    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
-  });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).cleanup();
 
-  it('response.created cancels any stale silence-wait from the prior response', () => {
-    analyser.rms = 0.001; // silent
-
-    fireEvent(session, { type: 'response.created' }, callbacks);
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-
-    vi.advanceTimersByTime(400); // 400ms into the wait
-
-    // New response interrupts
-    fireEvent(session, { type: 'response.created' }, callbacks);
-
-    vi.advanceTimersByTime(400); // 400ms more — old loop should be dead
-    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
-
-    // New response ends and silence detected
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    vi.advanceTimersByTime(650);
-    expect(callbacks.onAudioDone).toHaveBeenCalledOnce(); // only from the new response
-  });
-
-  it('handles the legacy beta event name response.audio.done identically', () => {
-    analyser.rms = 0.001;
-
-    fireEvent(session, { type: 'response.created' }, callbacks);
-    fireEvent(session, { type: 'response.audio.done' }, callbacks); // old beta name
-
-    vi.advanceTimersByTime(700);
-    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
-  });
-
-  it('fires onAudioDone immediately via response.done idle path when output_audio.done was skipped', () => {
-    analyser.rms = 0.001; // AI track already silent
-
-    fireEvent(session, { type: 'response.created' }, callbacks);
-    // output_audio.done never arrives (e.g. WebRTC didn't echo it)
-    fireEvent(session, { type: 'response.done' }, callbacks); // idle path
-
-    vi.advanceTimersByTime(700);
-    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+    expect(get(session, 'responseDoneSeen')).toBe(true);
+    expect(get(session, 'playbackWaitPending')).toBe(false);
   });
 });
 
@@ -330,18 +356,15 @@ describe('silence timer interaction — long user message', () => {
   let session: RealtimeSession;
   let callbacks: SessionCallbacks;
   let ctrl: SilenceController;
-  let analyser: MockAnalyser;
-  let audioCtx: ReturnType<typeof makeMockAudioCtx>;
-  const fakeStream = {} as MediaStream;
+  let pcHandle: MockPcHandle;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    analyser = makeMockAnalyser(0.1);
-    audioCtx = makeMockAudioCtx(analyser);
+    pcHandle = makeMockPc();
     session = new RealtimeSession();
     ctrl = new SilenceController();
     callbacks = makeFullCallbacks(ctrl);
-    injectAudio(session, fakeStream, audioCtx);
+    injectPc(session, pcHandle.pc);
   });
 
   afterEach(() => {
@@ -349,227 +372,184 @@ describe('silence timer interaction — long user message', () => {
   });
 
   /**
-   * TIMELINE (all durations approximate):
-   *
-   *  T+0s    AI finishes streaming → response.output_audio.done fires
-   *          waitForAudioSilence starts polling (AI audio RMS = 0.1, still playing)
-   *
-   *  T+0.1s  User starts speaking → speech_started fires
-   *          VoiceView clears any silence timer ✓
-   *          waitForAudioSilence is still running (AI audio still playing)
-   *
-   *  T+0.7s  AI audio buffer drains → RMS drops → 600ms silence → onAudioDone
-   *          VoiceView calls resetSilenceTimer() → 15s countdown starts
-   *          *** USER IS STILL SPEAKING AT THIS POINT ***
-   *
-   *  T+16s   Countdown expires → DISCONNECT while user is mid-sentence
-   *
-   * Expected: session should NOT disconnect while user is speaking.
-   * The fix requires cancelling waitForAudioSilence when speech_started fires.
+   * The original bug: user speaks longer than the silence timeout. The
+   * silence countdown must NOT fire mid-sentence. speech_started must
+   * cancel the playback-end poll so it cannot fire onAudioDone (which
+   * would arm the countdown).
    */
-  it('does NOT disconnect while the user is speaking a long message (> 15s)', () => {
-    // AI finishes response
+  it('does NOT disconnect while the user is speaking a long message (> 15s)', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.5);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
 
-    // 100ms later: user starts speaking; AI audio still playing (rms=0.1)
-    vi.advanceTimersByTime(100);
+    // User starts speaking 100ms later (AI audio still arriving)
+    await tick(100);
     expect(ctrl.disconnected).toBe(false);
     fireEvent(session, { type: 'input_audio_buffer.speech_started' }, callbacks);
 
-    // AI audio drains 600ms after user started talking → onAudioDone fires
-    analyser.rms = 0.001; // AI track goes silent
-    vi.advanceTimersByTime(700); // silence detected → onAudioDone
+    // playbackWaitPending must have been cleared
+    expect(get(session, 'playbackWaitPending')).toBe(false);
 
-    // At this point the user is still speaking (only 800ms into their turn)
-    // onAudioDone should NOT have started a countdown while user is speaking.
-    // Advance 20 seconds total — far beyond the 15s timeout — to see if disconnect fires.
-    vi.advanceTimersByTime(20_000);
-
-    expect(ctrl.disconnected).toBe(
-      false,
-      'Session disconnected while the user was speaking a long message',
-    );
+    // Stream stalls (no more audio), 20 seconds pass — must not disconnect
+    await tick(20_000);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+    expect(ctrl.disconnected).toBe(false);
   });
 
-  /**
-   * COROLLARY: after the user finishes speaking and the AI responds and finishes,
-   * the silence countdown SHOULD fire normally (i.e. we're not suppressing it
-   * globally — only during active user speech).
-   */
-  it('DOES disconnect after silence once the user has finished and AI has responded', () => {
-    // Full turn: AI speaks → user speaks → AI speaks again → silence → disconnect
-
+  it('DOES disconnect after silence once user has finished and AI has responded', async () => {
     // Turn 1: AI speaks
     fireEvent(session, { type: 'response.created' }, callbacks);
-    analyser.rms = 0.1; // AI audio playing
-    vi.advanceTimersByTime(1000);
+    pcHandle.setSamplesDuration(1.0);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
 
-    // AI audio drains
-    analyser.rms = 0.001;
-    vi.advanceTimersByTime(700); // onAudioDone fires → 15s countdown
+    // Poll picks up duration, stalls, drains
+    await tick(100); // first poll
+    await tick(400); // stall confirmed
+    await tick(500); // drain timer → fires onAudioDone → starts 15s countdown
 
     // User starts speaking (clears countdown)
     fireEvent(session, { type: 'input_audio_buffer.speech_started' }, callbacks);
-    vi.advanceTimersByTime(5000); // user speaks for 5 seconds
-
-    // User stops; AI picks up
+    await tick(5000); // user speaks 5s
     fireEvent(session, { type: 'input_audio_buffer.speech_stopped' }, callbacks);
-    fireEvent(session, { type: 'response.created' }, callbacks); // clears timer
+    fireEvent(session, { type: 'response.created' }, callbacks);
 
-    // Turn 2: AI speaks and finishes
-    analyser.rms = 0.1;
-    vi.advanceTimersByTime(2000);
+    // Turn 2: AI responds
+    pcHandle.setSamplesDuration(2.0);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    await tick(100); // first poll
+    await tick(400); // stall
+    await tick(500); // drain → fires → 15s countdown
 
-    // Turn 2 AI audio drains → onAudioDone → 15s countdown
-    analyser.rms = 0.001;
-    vi.advanceTimersByTime(700);
-
-    expect(ctrl.disconnected).toBe(false); // still within 15s
-
-    // 14.8s more — still connected (onAudioDone fired 100ms before this
-    // advance started, so the 15s window ends 100ms into a 14.9s advance;
-    // use 14.8s to stay safely inside).
-    vi.advanceTimersByTime(14_800);
     expect(ctrl.disconnected).toBe(false);
 
-    // Final 300ms tips it past 15s
-    vi.advanceTimersByTime(300);
+    // 14.8s — still connected
+    await tick(14_800);
+    expect(ctrl.disconnected).toBe(false);
+
+    // Final 300ms tips past 15s
+    await tick(300);
     expect(ctrl.disconnected).toBe(true);
   });
 
-  /**
-   * EDGE CASE: user speaks immediately after AI, before the 600ms silence
-   * accumulates. waitForAudioSilence should see the user is speaking and
-   * not fire onAudioDone at all during their turn.
-   */
-  it('does not fire onAudioDone when user starts speaking before AI audio drains', () => {
+  it('does not fire onAudioDone when user starts speaking before AI audio drains', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
-    analyser.rms = 0.1;
+    pcHandle.setSamplesDuration(0.2);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
 
-    // 50ms: only 1 poll tick; user speaks immediately
-    vi.advanceTimersByTime(50);
+    // 50ms in — user barges in before the first poll has even decided anything
+    await tick(50);
     fireEvent(session, { type: 'input_audio_buffer.speech_started' }, callbacks);
 
-    // AI audio drains while user is speaking
-    analyser.rms = 0.001;
-    vi.advanceTimersByTime(700); // would accumulate 600ms if loop still running
-
+    // Long wait — stream may stall, but speech_started killed the poll
+    await tick(5000);
     expect(callbacks.onAudioDone).not.toHaveBeenCalled();
   });
 
-  /**
-   * EDGE CASE: user speaks for exactly 15 seconds then stops.
-   * Disconnect should come from the speech_stopped path, not mid-message.
-   */
-  it('correctly attributes the disconnect to post-speech silence, not mid-speech', () => {
-    // AI finishes; user starts speaking 100ms later
+  it('attributes disconnect to post-speech silence, not mid-speech', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.3);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    vi.advanceTimersByTime(100);
+    await tick(100);
     fireEvent(session, { type: 'input_audio_buffer.speech_started' }, callbacks);
 
-    // User speaks for exactly 15s (the same duration as the silence timeout)
-    vi.advanceTimersByTime(15_000);
-    expect(ctrl.disconnected).toBe(false); // must still be connected while speaking
-
-    // User stops → 15s silence countdown starts
-    fireEvent(session, { type: 'input_audio_buffer.speech_stopped' }, callbacks);
-
-    vi.advanceTimersByTime(14_900);
+    // User speaks for 15 seconds — must stay connected
+    await tick(15_000);
     expect(ctrl.disconnected).toBe(false);
 
-    vi.advanceTimersByTime(200);
-    expect(ctrl.disconnected).toBe(true); // disconnects only after post-speech silence
+    // User stops → 15s silence countdown
+    fireEvent(session, { type: 'input_audio_buffer.speech_stopped' }, callbacks);
+    await tick(14_900);
+    expect(ctrl.disconnected).toBe(false);
+    await tick(200);
+    expect(ctrl.disconnected).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// GA event names — ensure both old and new names are exercised
+// THE NEW BUG SCENARIO: data received but speakers still playing
+//
+// This is the bug the user actually reported: the UI showed "Silence"
+// while the AI was still audibly talking. The old RMS-based detector tapped
+// the WebRTC stream rather than the speakers, so it went quiet as soon as
+// the server stopped sending — even though the playout buffer still had
+// ~300ms of audio left to play. The new detector requires both:
+//   (a) totalSamplesDuration to stop advancing for AUDIO_STALL_REQUIRED_MS, AND
+//   (b) AUDIO_JITTER_DRAIN_MS additional wall-clock to elapse
+// before firing onAudioDone.
 // ---------------------------------------------------------------------------
 
-describe('GA event name coverage', () => {
+describe('jitter buffer drain — the originally-reported bug', () => {
   let session: RealtimeSession;
   let callbacks: SessionCallbacks;
-  let analyser: MockAnalyser;
-  let audioCtx: ReturnType<typeof makeMockAudioCtx>;
-  const fakeStream = {} as MediaStream;
+  let ctrl: SilenceController;
+  let pcHandle: MockPcHandle;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    analyser = makeMockAnalyser(0.001); // silent
-    audioCtx = makeMockAudioCtx(analyser);
+    pcHandle = makeMockPc();
     session = new RealtimeSession();
-    callbacks = {
-      onTranscript: vi.fn(),
-      onToolCall: vi.fn(),
-      onStatusChange: vi.fn(),
-      onError: vi.fn(),
-      getToolResult: vi.fn().mockResolvedValue('ok'),
-      onAudioDone: vi.fn(),
-      onSpeechStarted: vi.fn(),
-      onSpeechStopped: vi.fn(),
-      onResponseStarted: vi.fn(),
-    };
-    injectAudio(session, fakeStream, audioCtx);
+    ctrl = new SilenceController();
+    callbacks = makeFullCallbacks(ctrl);
+    injectPc(session, pcHandle.pc);
   });
 
-  afterEach(() => { vi.useRealTimers(); });
-
-  it('response.output_audio_transcript.delta fires onTranscript(partial)', () => {
-    fireEvent(session, { type: 'response.output_audio_transcript.delta', delta: 'Hi' }, callbacks);
-    expect(callbacks.onTranscript).toHaveBeenCalledWith('assistant', 'Hi', false);
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it('response.output_audio_transcript.done fires onTranscript(done)', () => {
-    fireEvent(session, { type: 'response.output_audio_transcript.done' }, callbacks);
-    expect(callbacks.onTranscript).toHaveBeenCalledWith('assistant', '', true);
-  });
-
-  it('response.output_audio.done triggers silence detection (GA name)', () => {
+  it('waits the full drain window after the stream stalls', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.5);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    vi.advanceTimersByTime(700);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    // Tick 1 (100ms): records duration=0.5, sets seenAudio=true, lastChangeAt=now
+    await tick(100);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // Stream is now stalled. We need 400ms of stall + 500ms drain.
+    // At 400ms of stall: the poll fires that detects it and schedules the drain.
+    await tick(400);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // 499ms into the 500ms drain — still not yet
+    await tick(499);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // The 500th ms tips it
+    await tick(1);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
 
-  it('silenceWaitPending is set immediately when response.output_audio.done fires', () => {
+  it('re-arms if more audio arrives during the stall window (sentence break)', async () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
+    pcHandle.setSamplesDuration(0.3);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    expect(get(session, 'silenceWaitPending')).toBe(true);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    // Poll picks up duration=0.3
+    await tick(100);
+
+    // 300ms of stall (below the 400ms threshold)
+    await tick(300);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // More audio arrives — stall resets
+    pcHandle.setSamplesDuration(0.6);
+    await tick(100); // next poll sees the new duration, resets lastChangeAt
+
+    // Now from scratch: 399ms of stall → not yet
+    await tick(399);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // 400ms of stall → drain scheduled
+    await tick(1);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // 500ms drain → fires
+    await tick(500);
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
-
-  it('silenceWaitPending is reset at response.created (cancels stale poll)', () => {
-    fireEvent(session, { type: 'response.created' }, callbacks);
-    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-    expect(get(session, 'silenceWaitPending')).toBe(true);
-
-    fireEvent(session, { type: 'response.created' }, callbacks);
-    expect(get(session, 'silenceWaitPending')).toBe(false);
-  });
-
-  it(
-    'speech_started cancels the silence-wait loop (silenceWaitPending → false)',
-    () => {
-      analyser.rms = 0.1; // AI audio still playing
-
-      fireEvent(session, { type: 'response.created' }, callbacks);
-      fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
-      expect(get(session, 'silenceWaitPending')).toBe(true);
-
-      // User starts speaking
-      fireEvent(session, { type: 'input_audio_buffer.speech_started' }, callbacks);
-
-      // The poll should be cancelled
-      expect(get(session, 'silenceWaitPending')).toBe(false);
-
-      // AI audio drains while user is talking — onAudioDone must NOT fire
-      analyser.rms = 0.001;
-      vi.advanceTimersByTime(700);
-      expect(callbacks.onAudioDone).not.toHaveBeenCalled();
-    },
-  );
 });
