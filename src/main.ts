@@ -1,18 +1,52 @@
-import { Plugin, WorkspaceLeaf } from 'obsidian';
+import { Menu, Plugin, WorkspaceLeaf } from 'obsidian';
 import { VoiceView, VOICE_VIEW_TYPE } from './VoiceView';
+import { VoiceController } from './VoiceController';
 import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab, OPENAI_SECRET_ID } from './settings';
+import type { SessionStatus } from './RealtimeSession';
 
 export default class VoicePlugin extends Plugin {
   settings!: VoiceSettings;
+  controller!: VoiceController;
   wakeDetectorSuspended = false;
+
+  // Status bar UI elements
+  private statusBarItem!: HTMLElement;
+  private statusBarDot!: HTMLElement;
+  private statusBarText!: HTMLElement;
 
   async onload() {
     await this.loadSettings();
 
+    // Create the plugin-level controller (independent of any pane).
+    this.controller = new VoiceController(this);
+    this.controller.startTrackingActiveFile();
+
+    // Start wake word detector once the workspace is fully ready.
+    this.app.workspace.onLayoutReady(() => {
+      this.controller.syncWakeWordDetector();
+    });
+
+    // Register the pane view.
     this.registerView(VOICE_VIEW_TYPE, (leaf) => new VoiceView(leaf, this));
 
-    this.addRibbonIcon('mic', 'Voice', () => this.activateView());
+    // Ribbon icon — opens the transcript pane.
+    this.addRibbonIcon('mic', 'Voice — open panel', () => this.activateView());
 
+    // Status bar item — shows live status and opens a menu on click.
+    this.statusBarItem = this.addStatusBarItem();
+    this.statusBarItem.addClass('voice-statusbar-item');
+    this.statusBarItem.setAttribute('aria-label', 'Voice: click to connect / disconnect');
+    this.statusBarItem.setAttribute('title', 'Voice: click to connect / disconnect');
+
+    this.statusBarDot  = this.statusBarItem.createSpan({ cls: 'voice-statusbar-dot voice-statusbar-dot--idle' });
+    this.statusBarText = this.statusBarItem.createSpan({ cls: 'voice-statusbar-text', text: 'Voice' });
+
+    this.statusBarItem.addEventListener('click', (evt) => this.showStatusBarMenu(evt));
+
+    // Keep the status bar in sync with controller events.
+    this.controller.onStatusChange((status) => this.updateStatusBar(status));
+
+    // Commands
     this.addCommand({
       id: 'open-voice-panel',
       name: 'Open Voice panel',
@@ -22,21 +56,20 @@ export default class VoicePlugin extends Plugin {
     this.addCommand({
       id: 'toggle-voice-connection',
       name: 'Toggle Voice connection',
-      callback: async () => {
-        await this.activateView();
-        const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-        if (leaves.length > 0) {
-          const view = leaves[0].view as VoiceView;
-          await view.toggleConnection();
-        }
-      },
+      callback: () => this.controller.toggleConnection(),
+    });
+
+    this.addCommand({
+      id: 'toggle-wake-word',
+      name: 'Toggle wake word listening',
+      callback: () => this.toggleWakeWord(),
     });
 
     this.addSettingTab(new VoiceSettingTab(this.app, this));
 
     // Only the focused vault window should listen for wake words.
     // Each vault is its own Electron BrowserWindow; focus/blur fire when the
-    // user switches between them.  registerDomEvent auto-removes on unload.
+    // user switches between them. registerDomEvent auto-removes on unload.
     this.registerDomEvent(window, 'blur',  () => this.suspendWakeDetector());
     this.registerDomEvent(window, 'focus', () => this.resumeWakeDetector());
     // If this vault window isn't currently focused (e.g. opened in background
@@ -45,6 +78,7 @@ export default class VoicePlugin extends Plugin {
   }
 
   async onunload() {
+    this.controller.destroy();
     // Detach all Voice panel leaves on unload so Obsidian doesn't keep a
     // stale VoiceView instance alive across plugin reloads or BRAT updates.
     // Without this, the old view object stays in the leaf and new code that
@@ -56,36 +90,17 @@ export default class VoicePlugin extends Plugin {
 
   /** Called from the settings tab whenever wakeWordEnabled or wakeWord changes. */
   applyWakeWordSetting(): void {
-    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-    if (leaves.length > 0 && leaves[0].view instanceof VoiceView) {
-      leaves[0].view.syncWakeWordDetector();
-    }
+    this.controller.syncWakeWordDetector();
   }
 
   suspendWakeDetector(): void {
     this.wakeDetectorSuspended = true;
-    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-    if (leaves.length > 0) {
-      const view = leaves[0].view as VoiceView;
-      // Guard against stale view instances that pre-date this method
-      if (typeof view.stopWakeDetector === 'function') view.stopWakeDetector();
-    }
+    this.controller.stopWakeDetector();
   }
 
   resumeWakeDetector(): void {
     this.wakeDetectorSuspended = false;
-    const leaves = this.app.workspace.getLeavesOfType(VOICE_VIEW_TYPE);
-    if (leaves.length > 0) {
-      const view = leaves[0].view as VoiceView;
-      // activateWakeDetector() reuses the existing detector instance so ONNX
-      // models stay in memory across focus/blur — no "Loading models…" popup.
-      // Falls back to applyWakeWordSetting() only for stale view instances.
-      if (typeof view.activateWakeDetector === 'function') {
-        view.activateWakeDetector();
-      } else {
-        this.applyWakeWordSetting();
-      }
-    }
+    this.controller.activateWakeDetector();
   }
 
   async activateView() {
@@ -121,5 +136,80 @@ export default class VoicePlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  // ── Status bar menu ──────────────────────────────────────────────────────
+
+  private showStatusBarMenu(evt: MouseEvent): void {
+    const menu = new Menu();
+    const connected = this.controller.isConnected;
+
+    // Connect / Disconnect
+    menu.addItem((item) =>
+      item
+        .setTitle(connected ? 'Disconnect' : 'Connect')
+        .setIcon(connected ? 'mic-off' : 'mic')
+        .onClick(() => this.controller.toggleConnection()),
+    );
+
+    menu.addSeparator();
+
+    // Wake word toggle
+    const wakeEnabled = this.settings.wakeWordEnabled;
+    menu.addItem((item) =>
+      item
+        .setTitle(wakeEnabled ? 'Disable wake word' : 'Enable wake word')
+        .setIcon(wakeEnabled ? 'volume-x' : 'volume-2')
+        .onClick(() => this.toggleWakeWord()),
+    );
+
+    menu.addSeparator();
+
+    // Open transcript pane
+    menu.addItem((item) =>
+      item
+        .setTitle('Open Voice panel')
+        .setIcon('layout-panel-right')
+        .onClick(() => this.activateView()),
+    );
+
+    menu.showAtMouseEvent(evt);
+  }
+
+  private async toggleWakeWord(): Promise<void> {
+    this.settings.wakeWordEnabled = !this.settings.wakeWordEnabled;
+    await this.saveSettings();
+    this.controller.syncWakeWordDetector();
+    // Refresh status bar dot (listening vs idle state may change).
+    this.updateStatusBar(
+      this.controller.isConnected ? 'connected' : 'idle',
+    );
+  }
+
+  // ── Status bar rendering ─────────────────────────────────────────────────
+
+  private updateStatusBar(status: SessionStatus): void {
+    const isListening = !this.controller.isConnected && this.controller.isWakeWordActive();
+
+    const labels: Record<SessionStatus, string> = {
+      idle:       isListening ? 'Listening…' : 'Voice',
+      connecting: 'Connecting…',
+      connected:  'Voice',
+      error:      'Voice',
+    };
+
+    const dotMods: Record<SessionStatus, string> = {
+      idle:       isListening ? 'listening' : 'idle',
+      connecting: 'connecting',
+      connected:  'connected',
+      error:      'error',
+    };
+
+    this.statusBarText.textContent = labels[status];
+
+    for (const mod of ['idle', 'listening', 'connecting', 'connected', 'error']) {
+      this.statusBarDot.removeClass(`voice-statusbar-dot--${mod}`);
+    }
+    this.statusBarDot.addClass(`voice-statusbar-dot--${dotMods[status]}`);
   }
 }

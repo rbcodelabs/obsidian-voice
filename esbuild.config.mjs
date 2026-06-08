@@ -26,6 +26,7 @@ const pluginDir = process.env.OBSIDIAN_PLUGIN_DIR;
 // Additional vaults to sync to (real copies, not symlinks)
 const extraVaults = [
   path.join(process.env.HOME, 'projects/PluginTesting/.obsidian/plugins/obsidian-voice'),
+  path.join(process.env.HOME, 'Documents/Personal/.obsidian/plugins/obsidian-voice'),
 ];
 
 if (!fs.existsSync(outdir)) fs.mkdirSync(outdir, { recursive: true });
