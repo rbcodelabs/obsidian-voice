@@ -207,6 +207,7 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     // 11 ticks of silence → not yet (550ms)
     vi.advanceTimersByTime(550);
@@ -232,6 +233,7 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     // 400ms of audio playing
     vi.advanceTimersByTime(400);
@@ -254,6 +256,7 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     vi.advanceTimersByTime(400); // 400ms silent
     analyser.rms = 0.1;          // audio bursts back (e.g. comfort noise spike)
@@ -275,6 +278,7 @@ describe('waitForAudioSilence — core behaviour', () => {
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
     // second call is a no-op due to silenceWaitPending guard
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     vi.advanceTimersByTime(700);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
@@ -285,10 +289,11 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // first response done
 
     vi.advanceTimersByTime(400); // 400ms into the wait
 
-    // New response interrupts
+    // New response interrupts before the first poll could fire
     fireEvent(session, { type: 'response.created' }, callbacks);
 
     vi.advanceTimersByTime(400); // 400ms more — old loop should be dead
@@ -296,6 +301,7 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     // New response ends and silence detected
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // new response done
     vi.advanceTimersByTime(650);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce(); // only from the new response
   });
@@ -305,6 +311,7 @@ describe('waitForAudioSilence — core behaviour', () => {
 
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.audio.done' }, callbacks); // old beta name
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     vi.advanceTimersByTime(700);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
@@ -405,6 +412,7 @@ describe('silence timer interaction — long user message', () => {
     analyser.rms = 0.1; // AI audio playing
     vi.advanceTimersByTime(1000);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     // AI audio drains
     analyser.rms = 0.001;
@@ -422,6 +430,7 @@ describe('silence timer interaction — long user message', () => {
     analyser.rms = 0.1;
     vi.advanceTimersByTime(2000);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
 
     // Turn 2 AI audio drains → onAudioDone → 15s countdown
     analyser.rms = 0.001;
@@ -532,6 +541,7 @@ describe('GA event name coverage', () => {
   it('response.output_audio.done triggers silence detection (GA name)', () => {
     fireEvent(session, { type: 'response.created' }, callbacks);
     fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks); // un-gates onAudioDone
     vi.advanceTimersByTime(700);
     expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
   });
@@ -572,4 +582,141 @@ describe('GA event name coverage', () => {
       expect(callbacks.onAudioDone).not.toHaveBeenCalled();
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// responseDoneSeen gate — added in fix/auto-disconnect-robustness
+//
+// The polling loop must only fire onAudioDone when BOTH conditions hold:
+//   (1) RMS-confirmed silence for SILENCE_REQUIRED_MS
+//   (2) The server has finalised the response (response.done seen)
+// A mid-response packet stall or inter-sentence TTS pause can satisfy (1)
+// without (2), so we must NOT fire on (1) alone.
+// ---------------------------------------------------------------------------
+
+describe('responseDoneSeen gate', () => {
+  let session: RealtimeSession;
+  let callbacks: SessionCallbacks;
+  let analyser: MockAnalyser;
+  let audioCtx: ReturnType<typeof makeMockAudioCtx>;
+  const fakeStream = {} as MediaStream;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    analyser = makeMockAnalyser(0.001); // silent
+    audioCtx = makeMockAudioCtx(analyser);
+    session = new RealtimeSession();
+    callbacks = {
+      onTranscript: vi.fn(),
+      onToolCall: vi.fn(),
+      onStatusChange: vi.fn(),
+      onError: vi.fn(),
+      getToolResult: vi.fn().mockResolvedValue('ok'),
+      onAudioDone: vi.fn(),
+      onSpeechStarted: vi.fn(),
+      onSpeechStopped: vi.fn(),
+      onResponseStarted: vi.fn(),
+    };
+    injectAudio(session, fakeStream, audioCtx);
+  });
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('does NOT fire onAudioDone if response.done has not arrived (silence held indefinitely)', () => {
+    // Common production case: AI is mid-response, packet stall causes RMS to
+    // drop to zero for > 600 ms. We must not interpret that as end-of-turn.
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    // response.done withheld on purpose
+
+    vi.advanceTimersByTime(5_000); // 5s of silence, way past the 600ms window
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+  });
+
+  it('fires onAudioDone immediately when response.done arrives after silence was already confirmed', () => {
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+
+    // 700ms of silence — gate held: poll loop sits with silenceMs >= 600
+    vi.advanceTimersByTime(700);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // response.done lifts the gate; very next tick fires
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    vi.advanceTimersByTime(50);
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
+
+  it('re-arms when audio resumes between silence-confirmation and response.done', () => {
+    // Edge case: silence accumulates, then a late TTS sentence plays, then
+    // silence again, then response.done. Must require a fresh 600ms after
+    // the audio comes back down.
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+
+    // 700ms silence (gate blocks fire)
+    vi.advanceTimersByTime(700);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // Audio resumes for 300ms — accumulator resets
+    analyser.rms = 0.1;
+    vi.advanceTimersByTime(300);
+
+    // Silent again
+    analyser.rms = 0.001;
+
+    // response.done now arrives — but silence has only just restarted
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    // 550ms after audio went silent — not yet
+    vi.advanceTimersByTime(550);
+    expect(callbacks.onAudioDone).not.toHaveBeenCalled();
+
+    // 600ms of fresh silence → fires
+    vi.advanceTimersByTime(50);
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
+
+  it('response.done arriving without output_audio.done still fires via the idle safety path', () => {
+    // Tool-only / no-audio response.  The response.done handler calls
+    // waitForAudioSilence as a safety net AFTER setting responseDoneSeen=true,
+    // so the very first poll tick can fire (silence already present).
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+
+    vi.advanceTimersByTime(700);
+    expect(callbacks.onAudioDone).toHaveBeenCalledOnce();
+  });
+
+  it('responseDoneSeen resets on response.created so the next response is gated again', () => {
+    // Two-turn scenario: ensure the gate is properly re-armed between turns.
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    vi.advanceTimersByTime(700);
+    expect(callbacks.onAudioDone).toHaveBeenCalledTimes(1);
+
+    // Turn 2 starts — gate must reset
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    expect(get(session, 'responseDoneSeen')).toBe(false);
+
+    // Output audio done for turn 2, but no response.done yet
+    fireEvent(session, { type: 'response.output_audio.done' }, callbacks);
+    vi.advanceTimersByTime(2000); // even with long silence, must not fire
+    expect(callbacks.onAudioDone).toHaveBeenCalledTimes(1); // still only the first
+
+    // response.done turn 2 → fires shortly
+    fireEvent(session, { type: 'response.done' }, callbacks);
+    vi.advanceTimersByTime(100);
+    expect(callbacks.onAudioDone).toHaveBeenCalledTimes(2);
+  });
+
+  it('cleanup() resets responseDoneSeen to the safe default (true)', () => {
+    fireEvent(session, { type: 'response.created' }, callbacks);
+    expect(get(session, 'responseDoneSeen')).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (session as any).cleanup();
+    expect(get(session, 'responseDoneSeen')).toBe(true);
+  });
 });

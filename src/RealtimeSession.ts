@@ -58,6 +58,12 @@ export class RealtimeSession {
   private silenceWaitPending = false;
   // Guards against onAudioDone firing more than once per response.
   private audioDoneFired = false;
+  // True once response.done has arrived for the in-flight response. Gates
+  // onAudioDone: confirming RMS silence is not enough on its own. We also
+  // need the server to say the response is finalised, otherwise a
+  // mid-response packet stall or inter-sentence pause can be misread as
+  // end-of-turn. Reset on response.created, set on response.done.
+  private responseDoneSeen = true;
 
   async connect(
     apiKey: string,
@@ -221,6 +227,7 @@ export class RealtimeSession {
       this.isResponseActive = true;
       this.audioDoneFired = false; // arm for the new response
       this.silenceWaitPending = false; // cancel any stale silence-wait from prior response
+      this.responseDoneSeen = false; // gate onAudioDone until response.done arrives for this response
       callbacks.onResponseStarted?.();
       if (this.pendingNotificationContext) {
         this.currentResponseContext = { type: 'notification', threadId: this.pendingNotificationContext.threadId };
@@ -253,6 +260,7 @@ export class RealtimeSession {
       this.pendingToolCalls.push({ callId, name, argsJson });
     } else if (type === 'response.done') {
       this.isResponseActive = false;
+      this.responseDoneSeen = true; // un-gate onAudioDone; if a silence-wait is mid-flight it can now fire
       this.currentResponseContext = null;
 
       const resolvers = this.responseDoneResolvers.splice(0);
@@ -431,7 +439,17 @@ export class RealtimeSession {
       if (rms < SILENCE_THRESHOLD) {
         silenceMs += CHECK_MS;
         if (silenceMs >= SILENCE_REQUIRED_MS) {
-          if (this.debug) console.debug(`[Voice] waitForAudioSilence: silence confirmed (rms=${rms.toFixed(4)}) → onAudioDone`);
+          if (!this.responseDoneSeen) {
+            // Silence confirmed at the audio element, but the server has not
+            // yet finalised the response. Stay in the loop: if audio resumes
+            // (next sentence after a long pause, or recovery from a packet
+            // stall) silenceMs will reset on the next non-silent tick. Once
+            // response.done arrives, the very next tick will fire onAudioDone.
+            if (this.debug) console.debug(`[Voice] waitForAudioSilence: silence confirmed but response.done not yet seen — waiting`);
+            setTimeout(check, CHECK_MS);
+            return;
+          }
+          if (this.debug) console.debug(`[Voice] waitForAudioSilence: silence confirmed + response.done seen (rms=${rms.toFixed(4)}) → onAudioDone`);
           analyser.disconnect();
           this.silenceWaitPending = false;
           this.audioDoneFired = true;
@@ -548,6 +566,38 @@ export class RealtimeSession {
     this.dc.send(JSON.stringify({ type: 'response.create' }));
   }
 
+  /**
+   * Inject a user-role text message into the conversation and trigger a
+   * response. If a response is currently in flight it is cancelled first
+   * (same race-handling pattern as flushToolBatch and sendNotification).
+   *
+   * Used by the voice_disconnect abort UI: when the user clicks "Stay
+   * connected" during the 3-second grace, this is called with a brief
+   * "user cancelled" message so the model resumes the conversation.
+   */
+  async injectUserMessage(text: string): Promise<void> {
+    if (!this.dc || this.dc.readyState !== 'open') return;
+
+    if (this.debug) console.debug(`[Voice] injectUserMessage: isResponseActive=${this.isResponseActive} text="${text.slice(0, 80)}"`);
+
+    if (this.isResponseActive) {
+      if (this.debug) console.debug('[Voice] injectUserMessage: cancelling active response first');
+      this.dc.send(JSON.stringify({ type: 'response.cancel' }));
+      await new Promise<void>(resolve => this.responseDoneResolvers.push(resolve));
+      if (!this.dc || this.dc.readyState !== 'open') return;
+    }
+
+    this.dc.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+      },
+    }));
+    this.dc.send(JSON.stringify({ type: 'response.create' }));
+  }
+
   disconnect(): void {
     this.cleanup();
   }
@@ -580,6 +630,7 @@ export class RealtimeSession {
     // Cancel any running silence poll and release the AudioContext
     this.silenceWaitPending = false;
     this.audioDoneFired = false;
+    this.responseDoneSeen = true; // safe default once nothing is in flight
     this.audioElementSource = null; // released when ctx closes
     if (this.audioCtxForAnalysis) {
       void this.audioCtxForAnalysis.close();

@@ -408,3 +408,57 @@
 .voice-context-file-input::placeholder {
   color: var(--text-faint);
 }
+
+/* ── Disconnect-pending abort UI ──────────────────────────────────────────── */
+/* Shown in the transcript when the AI fires voice_disconnect; gives the user
+ * voiceDisconnectGraceSecs to click "Stay connected" or just keep talking
+ * before the session actually closes. */
+.voice-disconnect-pending {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-error-rgb, var(--background-modifier-border));
+  background: var(--background-modifier-error-hover, var(--background-secondary));
+  color: var(--text-normal);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.voice-disconnect-pending__title {
+  font-weight: 600;
+  font-size: 0.95em;
+}
+
+.voice-disconnect-pending__meta {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.voice-disconnect-pending__countdown {
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.voice-disconnect-pending__countdown--final {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.voice-disconnect-pending__stay-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--interactive-accent);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 0.9em;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.voice-disconnect-pending__stay-btn:hover {
+  background: var(--interactive-accent-hover);
+}

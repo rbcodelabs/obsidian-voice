@@ -25,6 +25,12 @@ export interface VoiceSettings {
   wakeWord: string;
   /** Seconds of silence before the session auto-disconnects (0 = disabled). */
   silenceTimeoutSecs: number;
+  /**
+   * Seconds the user has to cancel ("Stay connected") after the AI fires the
+   * voice_disconnect tool. Prevents the AI from cutting off the conversation
+   * mid-thought due to a misheard goodbye. Minimum 1, max 30. Default 3.
+   */
+  voiceDisconnectGraceSecs: number;
   /** Confidence threshold for wake word detection (0–1). Lower = more sensitive, more false positives. */
   wakeWordThreshold: number;
   /** Voice templates from enrollment (top-3 averaged embedding vectors, each 96 floats). */
@@ -40,6 +46,7 @@ export const DEFAULT_SETTINGS: Omit<VoiceSettings, 'openaiApiKey'> = {
   wakeWordEnabled: false,
   wakeWord: 'hey obsidian',
   silenceTimeoutSecs: 15,
+  voiceDisconnectGraceSecs: 3,
   wakeWordThreshold: 0.75,
   enrollmentEmbeddings: null,
 };
@@ -386,6 +393,28 @@ export class VoiceSettingTab extends PluginSettingTab {
           });
         text.inputEl.type = 'number';
         text.inputEl.min = '0';
+        text.inputEl.style.width = '5em';
+      });
+
+    new Setting(containerEl)
+      .setName('Disconnect grace period')
+      .setDesc(
+        'When the AI decides to end the session (e.g. it thinks you said goodbye), ' +
+        'how many seconds you get to click "Stay connected" before the session actually closes. ' +
+        'Speaking during this window also cancels the disconnect. Minimum 1, maximum 30.',
+      )
+      .addText(text => {
+        text
+          .setPlaceholder('3')
+          .setValue(String(this.plugin.settings.voiceDisconnectGraceSecs))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            this.plugin.settings.voiceDisconnectGraceSecs = isNaN(n) ? 3 : Math.min(30, Math.max(1, n));
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = 'number';
+        text.inputEl.min = '1';
+        text.inputEl.max = '30';
         text.inputEl.style.width = '5em';
       });
 
