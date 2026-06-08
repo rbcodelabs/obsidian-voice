@@ -1,23 +1,23 @@
 {
-  "name": "obsidian-voice",
-  "version": "0.3.14",
-  "description": "Talk with your documents using OpenAI Realtime Voice",
-  "main": "dist/main.js",
-  "scripts": {
-    "build": "node esbuild.config.mjs",
-    "dev": "node esbuild.config.mjs --watch",
-    "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "dependencies": {
-    "onnxruntime-web": "^1.26.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "esbuild": "^0.28.0",
-    "obsidian": "^1.7.2",
-    "typescript": "^5.0.0",
-    "vitest": "^4.1.7",
-    "ws": "^8.21.0"
-  }
+	"name": "obsidian-voice",
+	"version": "0.4.0",
+	"description": "Talk with your documents using OpenAI Realtime Voice",
+	"main": "dist/main.js",
+	"scripts": {
+		"build": "node esbuild.config.mjs",
+		"dev": "node esbuild.config.mjs --watch",
+		"test": "vitest run",
+		"test:watch": "vitest"
+	},
+	"dependencies": {
+		"onnxruntime-web": "^1.26.0"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"esbuild": "^0.28.0",
+		"obsidian": "^1.7.2",
+		"typescript": "^5.0.0",
+		"vitest": "^4.1.7",
+		"ws": "^8.21.0"
+	}
 }
