@@ -463,15 +463,17 @@
   background: var(--interactive-accent-hover);
 }
 
-/* ── Status bar item (lives in Obsidian's bottom status bar) ─────────────── */
+/* ── Status bar item ─────────────────────────────────────────────────────── */
+/* Visible-on-every-theme version. Literal hex colors, explicit sizing,
+   inline-block as a fallback in case flex children don't size correctly. */
 
 .voice-statusbar-item {
-  display: flex;
+  display: inline-flex !important;
   align-items: center;
-  gap: 5px;
+  gap: 8px;
   cursor: pointer;
-  padding: 0 4px;
-  border-radius: 3px;
+  padding: 2px 8px;
+  border-radius: 4px;
   transition: background-color 0.15s ease;
   user-select: none;
 }
@@ -480,39 +482,44 @@
   background-color: var(--background-modifier-hover);
 }
 
+/* The dot is the "●" character (U+25CF). We just color it via `color`. The
+   glyph itself has natural width/height from the font — no box sizing
+   battle with Obsidian's status-bar CSS to fight. */
 .voice-statusbar-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  transition: background-color 0.3s ease;
+  font-size: 1.15em;
+  line-height: 1;
+  color: #888;
+  margin-right: 8px;
+  transition: color 0.3s ease;
 }
 
 .voice-statusbar-dot--idle {
-  background-color: var(--text-faint);
+  color: #888;
 }
 
 .voice-statusbar-dot--listening {
-  background-color: var(--color-blue);
+  color: #4287f5;
   animation: voice-pulse 1.8s ease-in-out infinite;
 }
 
 .voice-statusbar-dot--connecting {
-  background-color: var(--color-yellow);
+  color: #d4a017;
   animation: voice-pulse 1.2s ease-in-out infinite;
 }
 
 .voice-statusbar-dot--connected {
-  background-color: var(--color-green);
+  color: #2da44e;
 }
 
 .voice-statusbar-dot--error {
-  background-color: var(--color-red);
+  color: #cf222e;
 }
 
 .voice-statusbar-text {
+  display: inline-block;
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
+  vertical-align: middle;
 }
 
 @keyframes voice-pulse {

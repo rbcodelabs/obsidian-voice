@@ -236,6 +236,45 @@ export class RealtimeSession {
       return;
     }
 
+    // ── Playback lifecycle (newer OpenAI Realtime API) ──────────────────────
+    // The server emits output_audio_buffer.{started,stopped,cleared} on the
+    // data channel as the audio playback BUFFER (not just the byte stream)
+    // changes state. `stopped` is the definitive "the AI is done talking"
+    // signal — server knows the audio frames have been fully delivered.
+    //
+    // This is preferable to the getStats() polling fallback because it is
+    // synchronous and cannot stall. Older deployments may not emit these
+    // events, which is why waitForAudioPlaybackEnd() still exists as backup.
+    if (type === 'output_audio_buffer.stopped') {
+      if (this.debug) console.debug('[Voice] output_audio_buffer.stopped → firing onAudioDone immediately');
+      // Cancel any in-flight polling so it can't fire later and double-trigger.
+      this.playbackWaitPending = false;
+      if (!this.audioDoneFired) {
+        this.audioDoneFired = true;
+        callbacks.onAudioDone?.();
+      }
+      return;
+    }
+
+    if (type === 'output_audio_buffer.cleared') {
+      // Server interrupted/discarded the buffered audio (e.g. user barge-in).
+      // Treat like stopped — the AI is no longer producing audio.
+      if (this.debug) console.debug('[Voice] output_audio_buffer.cleared → firing onAudioDone (treated as stop)');
+      this.playbackWaitPending = false;
+      if (!this.audioDoneFired) {
+        this.audioDoneFired = true;
+        callbacks.onAudioDone?.();
+      }
+      return;
+    }
+
+    if (type === 'output_audio_buffer.started') {
+      // Optional logging hook; no state change here — onResponseStarted has
+      // already moved us into 'ai-responding' via response.created.
+      if (this.debug) console.debug('[Voice] output_audio_buffer.started');
+      return;
+    }
+
     if (type === 'response.created') {
       this.isResponseActive = true;
       this.audioDoneFired = false; // arm for the new response

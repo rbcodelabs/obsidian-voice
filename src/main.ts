@@ -1,4 +1,4 @@
-import { Menu, Plugin, WorkspaceLeaf } from 'obsidian';
+import { Menu, Notice, Plugin, WorkspaceLeaf } from 'obsidian';
 import { VoiceView, VOICE_VIEW_TYPE } from './VoiceView';
 import { VoiceController } from './VoiceController';
 import { VoiceSettings, DEFAULT_SETTINGS, VoiceSettingTab, OPENAI_SECRET_ID } from './settings';
@@ -33,13 +33,25 @@ export default class VoicePlugin extends Plugin {
     this.addRibbonIcon('mic', 'Voice — open panel', () => this.activateView());
 
     // Status bar item — shows live status and opens a menu on click.
+    // Exact structure from v0.4.0 — a span dot + span text inside a flex
+    // container. Don't reinvent this.
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass('voice-statusbar-item');
     this.statusBarItem.setAttribute('aria-label', 'Voice: click to connect / disconnect');
     this.statusBarItem.setAttribute('title', 'Voice: click to connect / disconnect');
 
-    this.statusBarDot  = this.statusBarItem.createSpan({ cls: 'voice-statusbar-dot voice-statusbar-dot--idle' });
+    // Use the Unicode "●" (U+25CF BLACK CIRCLE) as the dot — it has intrinsic
+    // glyph size from the font, so no width/height CSS is needed. Empty spans
+    // collapse to 0x0 the moment any rule overrides display:inline-block.
+    // Spacing is set as INLINE STYLE so it beats any theme/Obsidian CSS — the
+    // external stylesheet's margin keeps getting overridden by something in
+    // the cascade that we don't control.
+    this.statusBarDot  = this.statusBarItem.createSpan({ cls: 'voice-statusbar-dot voice-statusbar-dot--idle', text: '●' });
+    this.statusBarDot.style.marginRight = '8px';
+    this.statusBarDot.style.fontSize = '1.15em';
+    this.statusBarDot.style.lineHeight = '1';
     this.statusBarText = this.statusBarItem.createSpan({ cls: 'voice-statusbar-text', text: 'Voice' });
+    this.statusBarText.style.marginLeft = '0';
 
     this.statusBarItem.addEventListener('click', (evt) => this.showStatusBarMenu(evt));
 
@@ -48,6 +60,11 @@ export default class VoicePlugin extends Plugin {
     // machine label inside a 'connected' session, e.g. "Silence — 12s").
     this.controller.onStatusChange((status) => this.updateStatusBar(status));
     this.controller.onActivityChange(() => this.updateStatusBar(this.controller.currentStatus));
+
+    // Paint once with current intent so the bar reflects "Listening…" even
+    // before the wake detector finishes loading models (it can take a beat
+    // after onLayoutReady, and the user shouldn't see a stale "Voice" label).
+    this.updateStatusBar(this.controller.currentStatus);
 
     // Commands
     this.addCommand({
@@ -95,11 +112,13 @@ export default class VoicePlugin extends Plugin {
   suspendWakeDetector(): void {
     this.wakeDetectorSuspended = true;
     this.controller.stopWakeDetector();
+    this.updateStatusBar(this.controller.currentStatus);
   }
 
   resumeWakeDetector(): void {
     this.wakeDetectorSuspended = false;
     this.controller.activateWakeDetector();
+    this.updateStatusBar(this.controller.currentStatus);
   }
 
   async activateView() {
@@ -164,7 +183,17 @@ export default class VoicePlugin extends Plugin {
       item
         .setTitle('Open Voice panel')
         .setIcon('layout-panel-right')
-        .onClick(() => this.activateView()),
+        // Defer to the next tick so the Menu finishes closing before we
+        // mutate the workspace — otherwise the leaf creation can race the
+        // menu teardown and silently swallow the click.
+        .onClick(() => {
+          setTimeout(() => {
+            this.activateView().catch((err) => {
+              console.error('[Voice] activateView failed:', err);
+              new Notice('Voice: failed to open panel — check the console.');
+            });
+          }, 0);
+        }),
     );
 
     menu.showAtMouseEvent(evt);
@@ -182,7 +211,16 @@ export default class VoicePlugin extends Plugin {
   private updateStatusBar(status: SessionStatus): void {
     const ctrl = this.controller;
     const activity = ctrl.getActivityInfo();
-    const isListening = !ctrl.isConnected && ctrl.isWakeWordActive();
+    // "Listening…" reflects USER INTENT, not detector internals. The detector
+    // takes a few hundred ms to load ONNX models after onLayoutReady, and is
+    // also briefly null between focus/blur transitions — but during all of
+    // that the user still expects to see "Listening…" because that's what
+    // they configured. Only fall back to "Voice" when the wake word is truly
+    // off or the window is unfocused (and therefore actually paused).
+    const isListening =
+      !ctrl.isConnected &&
+      this.settings.wakeWordEnabled &&
+      !this.wakeDetectorSuspended;
 
     // Connected: surface the live state-machine label so the user can see what
     // the session is doing without opening the panel.
@@ -224,10 +262,28 @@ export default class VoicePlugin extends Plugin {
     if (this.statusBarText) this.statusBarText.textContent = labels[status];
 
     if (this.statusBarDot) {
-      for (const mod of ['idle', 'listening', 'connecting', 'connected', 'error']) {
-        this.statusBarDot.removeClass(`voice-statusbar-dot--${mod}`);
+      const mod = dotMods[status];
+      // Keep the class for theme overrides, but ALSO set color inline so we
+      // beat any cascade rules that have been overriding our stylesheet.
+      for (const m of ['idle', 'listening', 'connecting', 'connected', 'error']) {
+        this.statusBarDot.removeClass(`voice-statusbar-dot--${m}`);
       }
-      this.statusBarDot.addClass(`voice-statusbar-dot--${dotMods[status]}`);
+      this.statusBarDot.addClass(`voice-statusbar-dot--${mod}`);
+
+      const colors: Record<string, string> = {
+        idle:       '#888888',  // gray
+        listening:  '#4287f5',  // blue
+        connecting: '#d4a017',  // amber
+        connected:  '#2da44e',  // green
+        error:      '#cf222e',  // red
+      };
+      this.statusBarDot.style.color = colors[mod] ?? colors.idle;
+
+      // Pulse animation for live states (listening / connecting).
+      const shouldPulse = mod === 'listening' || mod === 'connecting';
+      this.statusBarDot.style.animation = shouldPulse
+        ? 'voice-pulse 1.5s ease-in-out infinite'
+        : '';
     }
   }
 }
