@@ -798,22 +798,26 @@ export class VoiceController {
         'Use ct_new_thread to start a fresh agent and ct_send_message to reply in an existing thread.' +
         '\n\n== Async thread rules — read carefully ==' +
         '\n• When you call ct_send_message or ct_new_thread with wait=true (default), the tool BLOCKS ' +
-        'until the agent finishes and returns the final result to you directly. You handle it in one turn.' +
+        'until the agent finishes and returns the final result. Handle it in one turn.' +
         '\n• When wait=false, the thread runs in the BACKGROUND. The tool returns immediately with just the ' +
-        'thread ID — NOT the result. The agent is still working.' +
-        '\n• For background threads, you will receive EXACTLY ONE proactive voice notification per thread, ' +
-        'and only when the thread has FINISHED (done or error). You will never be notified about partial ' +
-        'progress, tool calls the agent is making, or intermediate messages. Mid-stream updates are ' +
-        'deliberately hidden from you.' +
-        '\n• Therefore: if you have NOT received a completion notification, the thread is still working. ' +
-        'DO NOT ask the user "are you still working?" or "is it done yet?" — the user already sees live ' +
-        'progress in the Claude Threads panel. DO NOT send follow-up ct_send_message calls to the same ' +
-        'thread while it is still running; that just queues another request behind the current one.' +
-        '\n• If the user explicitly asks for a progress check, call ct_get_thread(thread_id) to read the ' +
-        'current message log. Do NOT poll proactively.' +
-        '\n• When a completion notification arrives, acknowledge it briefly and naturally, then either ' +
-        'summarize the result or ask the user what they want to do next. Do NOT recite the entire ' +
-        'final message verbatim — paraphrase the key point.';
+        'thread ID — NOT the result.' +
+        '\n• While a background thread is running, you will receive proactive voice notifications with its ' +
+        'PARTIAL progress (each new message it posts). Each notification arrives tagged with one of:' +
+        '\n    [Thread STATUS=working id="…"]  → the agent is still actively working' +
+        '\n    [Thread STATUS=idle id="…"]     → the agent posted a message and stopped (but no done signal)' +
+        '\n    [Thread STATUS=done id="…"]     → terminal: the thread finished successfully' +
+        '\n    [Thread STATUS=error id="…"]    → terminal: the thread errored out' +
+        '\n• Your job when you receive a STATUS=working partial: narrate briefly to the USER in one short ' +
+        'sentence (e.g., "Looks like it\'s now reading the README.") so they stay informed. ' +
+        'CRITICAL: DO NOT call ct_send_message on a thread that is STATUS=working — the agent has work in ' +
+        'flight and a new message would just queue behind it. Just talk to the user.' +
+        '\n• On STATUS=done or STATUS=error: acknowledge the result, paraphrase the key point (don\'t recite ' +
+        'verbatim), and ask the user what to do next. After this, ct_send_message is fair game again.' +
+        '\n• On STATUS=idle (rare — usually means a message arrived just before the done signal): treat ' +
+        'like done. The agent is not currently working but the thread is also not formally finished.' +
+        '\n• NEVER ask the user "is the thread still working?" or "is it done yet?" — the notifications ' +
+        'already tell you. NEVER poll ct_get_thread proactively. Call it only when the user explicitly ' +
+        'asks for a status check or for the full transcript of a thread.';
     }
     if (contextFilesContent.trim()) {
       prompt += '\n\n' + contextFilesContent.trim();
