@@ -1,120 +1,23 @@
-import { ItemView, MarkdownView, Notice, TFile, WorkspaceLeaf } from 'obsidian';
+import { ItemView, MarkdownView, WorkspaceLeaf } from 'obsidian';
 import type VoicePlugin from './main';
-import { RealtimeSession, SessionStatus } from './RealtimeSession';
-import { DOCUMENT_TOOLS, executeToolCall } from './DocumentTools';
-import { CLAUDE_THREADS_TOOLS, CLAUDE_THREADS_TOOL_NAMES, executeClaudeThreadsTool } from './ClaudeThreadsTools';
-import { NotificationBridge } from './NotificationBridge';
-import { OPENAI_SECRET_ID, REALTIME_MODEL } from './settings';
-import { WakeWordDetector } from './WakeWordDetector';
+import type { SessionStatus } from './RealtimeSession';
+import type {
+  ActivityInfo,
+  DisconnectPendingEvent,
+  ToolLine,
+  TranscriptLine,
+} from './VoiceController';
 
 export const VOICE_VIEW_TYPE = 'obsidian-voice:panel';
 
 /**
- * Activity states for a live voice session. The countdown watchdog only runs
- * in 'silence'. 'disconnect-pending' has its own short timer (3s default)
- * driven by voiceDisconnectGraceSecs.
- *
- *   listening          connected, no turn in flight              no timer
- *   user-speaking      between speech_started and speech_stopped no timer
- *   ai-responding      between response.created and response.done no timer
- *   tool-running       at least one tool call mid-execution      no timer
- *   silence            fully idle                                silence countdown
- *   disconnect-pending AI fired voice_disconnect tool            grace countdown
+ * Thin observer of VoiceController. Owns NO session state — just subscribes
+ * to controller events and renders the transcript / status / abort UI. The
+ * panel can be opened and closed freely without disturbing the live session,
+ * which lives on the controller (plugin-level singleton).
  */
-export type SessionActivity =
-  | 'listening'
-  | 'user-speaking'
-  | 'ai-responding'
-  | 'tool-running'
-  | 'silence'
-  | 'disconnect-pending';
-
-const VOICE_CONTROL_TOOLS = [
-  {
-    type: 'function',
-    name: 'voice_disconnect',
-    description:
-      'End the voice session. ONLY call this when the user has CLEARLY AND EXPLICITLY asked ' +
-      'to end the conversation. Clear requests look like: "end session", "goodbye obsidian", ' +
-      '"disconnect", "stop voice", "I am done". ' +
-      'DO NOT call this for filler words ("ok", "thanks", "alright", "hmm"), for pauses in the ' +
-      'conversation, for the user trailing off mid-thought, or for vague or implied endings. ' +
-      'If there is ANY chance the user wants to keep talking, do NOT call this — keep the ' +
-      'conversation going. You must provide both a reason and the exact phrase you heard.',
-    parameters: {
-      type: 'object',
-      properties: {
-        reason: {
-          type: 'string',
-          description:
-            'One short sentence explaining why you are ending the session ' +
-            '(e.g. "User said goodbye and asked to end the session").',
-        },
-        phrase: {
-          type: 'string',
-          description:
-            'The exact words the user said that you interpret as ending the session, verbatim. ' +
-            'Do not paraphrase.',
-        },
-      },
-      required: ['reason', 'phrase'],
-    },
-  },
-  {
-    type: 'function',
-    name: 'voice_wait',
-    description: 'Pause for a specified number of seconds before responding. Useful when waiting for something to happen.',
-    parameters: {
-      type: 'object',
-      properties: {
-        seconds: { type: 'number', description: 'How many seconds to wait (1–300).' },
-        reason: { type: 'string', description: 'Optional reason for waiting, shown in the transcript.' },
-      },
-      required: ['seconds'],
-    },
-  },
-];
-
-interface TranscriptEntry {
-  role: 'user' | 'assistant' | 'tool';
-  text: string;
-  el: HTMLElement;
-}
-
 export class VoiceView extends ItemView {
   private plugin: VoicePlugin;
-  private session: RealtimeSession | null = null;
-  private isConnected = false;
-  private notificationBridge: NotificationBridge | null = null;
-  // Tracks the last markdown tab the user focused. Stays populated even when
-  // the Voice panel itself is active, so Connect always targets the document
-  // you were just looking at.
-  private lastMarkdownView: MarkdownView | null = null;
-
-  // Wake word
-  private wakeDetector: WakeWordDetector | null = null;
-
-  // Silence watchdog — only runs while sessionActivity === 'silence'.
-  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private countdownInterval: ReturnType<typeof setInterval> | null = null;
-  private silenceSecsLeft = 0;
-
-  // Real-time session activity — drives the status label and the timer.
-  // All transitions route through transitionTo(); never assign directly.
-  private sessionActivity: SessionActivity = 'listening';
-
-  // Disconnect-pending state — driven by the voice_disconnect tool. Independent
-  // of the silence watchdog so the AI can request a disconnect even while the
-  // silence countdown was disabled (silenceTimeoutSecs=0).
-  private disconnectPendingTimer: ReturnType<typeof setTimeout> | null = null;
-  private disconnectPendingInterval: ReturnType<typeof setInterval> | null = null;
-  private disconnectPendingSecsLeft = 0;
-  // The transcript event UI for an active disconnect-pending state, kept so
-  // we can update its countdown text and replace it on abort.
-  private disconnectPendingEl: HTMLElement | null = null;
-  // Captured for telemetry and the abort message back to the model.
-  private disconnectPendingReason = '';
-  private disconnectPendingPhrase = '';
 
   // UI elements
   private statusDot!: HTMLElement;
@@ -123,62 +26,49 @@ export class VoiceView extends ItemView {
   private contextBanner!: HTMLElement;
   private transcriptContainer!: HTMLElement;
 
-  // Transcript state
-  private entries: TranscriptEntry[] = [];
-  private pendingAssistant: TranscriptEntry | null = null;
-  private pendingUser: TranscriptEntry | null = null;
-  private pendingToolEls = new Map<string, HTMLElement>();
+  // DOM nodes keyed by transcript/tool line ID for in-place updates.
+  private lineEls = new Map<string, HTMLElement>();
+
+  // Disconnect-pending abort UI is a special transcript element that the
+  // controller drives via the onDisconnectPending event stream.
+  private disconnectPendingEl: HTMLElement | null = null;
+  private disconnectPendingCountdownEl: HTMLElement | null = null;
+
+  // Unsubscribe functions returned by controller.on*
+  private unsubs: Array<() => void> = [];
 
   constructor(leaf: WorkspaceLeaf, plugin: VoicePlugin) {
     super(leaf);
     this.plugin = plugin;
   }
 
-  getViewType(): string {
-    return VOICE_VIEW_TYPE;
-  }
-
-  getDisplayText(): string {
-    return 'Voice';
-  }
-
-  getIcon(): string {
-    return 'mic';
-  }
+  getViewType(): string { return VOICE_VIEW_TYPE; }
+  getDisplayText(): string { return 'Voice'; }
+  getIcon(): string { return 'mic'; }
 
   async onOpen(): Promise<void> {
     const root = this.containerEl.children[1] as HTMLElement;
     root.empty();
     root.addClass('voice-panel');
 
-    // Header: status indicator row + full-width connect button (separate rows
-    // so the status text never competes for space with the button).
+    // Header: status row + full-width connect button
     const header = root.createDiv({ cls: 'voice-header' });
     const statusBar = header.createDiv({ cls: 'voice-status' });
     this.statusDot = statusBar.createSpan({ cls: 'voice-status__dot' });
     this.statusText = statusBar.createSpan({ cls: 'voice-status__text', text: 'Idle' });
     this.connectBtn = header.createEl('button', {
       cls: 'voice-connect-btn',
-      text: 'Connect',
+      text: this.plugin.controller.isConnected ? 'Disconnect' : 'Connect',
     });
-    this.connectBtn.addEventListener('click', () => this.handleConnectToggle());
+    this.connectBtn.addEventListener('click', () => this.plugin.controller.toggleConnection());
 
     // Context banner — shows which file will be sent as context
     this.contextBanner = root.createDiv({ cls: 'voice-context-banner' });
-
-    // Seed the tracker with whatever is already active when the panel opens.
-    // getActiveViewOfType works here because we haven't stolen focus yet.
-    this.lastMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
     this.updateContextBanner();
 
-    // Keep the tracker current as the user navigates tabs.
-    // When focus moves to the Voice panel the leaf is not a MarkdownView, so
-    // we leave lastMarkdownView alone — the previous document stays tracked.
+    // Keep the context banner current as the user navigates tabs.
     this.registerEvent(
-      this.app.workspace.on('active-leaf-change', (leaf) => {
-        if (leaf?.view instanceof MarkdownView && leaf.view.file) {
-          this.lastMarkdownView = leaf.view as MarkdownView;
-        }
+      this.app.workspace.on('active-leaf-change', () => {
         this.updateContextBanner();
       })
     );
@@ -186,551 +76,59 @@ export class VoiceView extends ItemView {
     // Transcript container
     this.transcriptContainer = root.createDiv({ cls: 'voice-transcript' });
 
-    this.updateStatus('idle');
+    // Replay any buffered transcript/tool lines from before the pane was opened.
+    for (const line of this.plugin.controller.transcriptBuffer) {
+      this.renderTranscriptLine(line);
+    }
+    for (const tool of this.plugin.controller.toolBuffer) {
+      this.renderToolLine(tool);
+    }
+    this.scrollToBottom();
 
-    // Start wake word detector if enabled
-    this.syncWakeWordDetector();
+    // Subscribe to live controller events.
+    this.unsubs.push(
+      this.plugin.controller.onStatusChange((status) => this.updateStatus(status)),
+      this.plugin.controller.onActivityChange(() => this.updateStatus(this.plugin.controller.currentStatus)),
+      this.plugin.controller.onTranscript((line) => this.renderTranscriptLine(line)),
+      this.plugin.controller.onToolEvent((tool) => this.renderToolLine(tool)),
+      this.plugin.controller.onDisconnectPending((evt) => this.handleDisconnectPendingEvent(evt)),
+    );
+
+    // Render current status.
+    this.updateStatus(this.plugin.controller.currentStatus);
   }
 
   async onClose(): Promise<void> {
-    this.clearSilenceTimer();
-    this.clearDisconnectPendingTimer();
-    this.wakeDetector?.stop();
-    this.wakeDetector = null;
-    this.session?.disconnect();
-    this.session = null;
-    this.isConnected = false;
+    for (const unsub of this.unsubs) unsub();
+    this.unsubs = [];
+    this.lineEls.clear();
+    this.disconnectPendingEl = null;
+    this.disconnectPendingCountdownEl = null;
   }
+
+  // ── Backward-compat delegates ────────────────────────────────────────────
 
   async toggleConnection(): Promise<void> {
-    if (this.isConnected) {
-      this.doDisconnect();
-    } else {
-      await this.doConnect();
-    }
+    return this.plugin.controller.toggleConnection();
   }
 
-  /** Stop the wake word detector without affecting session state. Used by enrollment. */
   stopWakeDetector(): void {
-    // Stop audio capture but keep the WakeWordDetector instance alive so the
-    // ONNX models stay in memory.  activateWakeDetector() can then resume with
-    // just an audio restart — no model download or re-load on window focus.
-    this.wakeDetector?.stop();
-    this.updateStatus('idle'); // refresh label to show suspended state if applicable
+    this.plugin.controller.stopWakeDetector();
   }
 
-  /**
-   * Called by main.ts when the vault window regains focus.
-   * Fast path: if a stopped detector instance already exists (models loaded),
-   * just restart audio capture.  Falls back to syncWakeWordDetector() only
-   * when no instance is cached (first use, or after a session disconnect).
-   */
   activateWakeDetector(): void {
-    if (this.wakeDetector && !this.isConnected && !this.plugin.wakeDetectorSuspended) {
-      this.wakeDetector.start(); // reuses loaded models — no popup
-      this.updateStatus('idle');
-      return;
-    }
-    this.syncWakeWordDetector();
+    this.plugin.controller.activateWakeDetector();
   }
 
-  /**
-   * Called by main.ts whenever wakeWordEnabled or wakeWord changes in settings,
-   * and from onOpen after the UI is ready.
-   */
   syncWakeWordDetector(): void {
-    const { wakeWordEnabled, debugLogging } = this.plugin.settings;
-
-    // Stop any existing detector first
-    if (this.wakeDetector) {
-      this.wakeDetector.stop();
-      this.wakeDetector = null;
-    }
-
-    if (!wakeWordEnabled || this.isConnected || this.plugin.wakeDetectorSuspended) {
-      this.updateStatus('idle');
-      return;
-    }
-
-    // Resolve absolute path to plugin directory so the ONNX models can be read.
-    const adapter = this.plugin.app.vault.adapter as { basePath?: string };
-    const modelDir = adapter.basePath && this.plugin.manifest.dir
-      ? `${adapter.basePath}/${this.plugin.manifest.dir}`
-      : (this.plugin.manifest.dir ?? '');
-
-    let downloadNotice: Notice | null = null;
-    this.wakeDetector = new WakeWordDetector(
-      modelDir,
-      () => {
-        if (debugLogging) {
-          console.log('[Voice] Wake word detected — auto-connecting');
-        }
-        this.addToolEvent('Wake word detected: "hey obsidian" — connecting…');
-        void this.doConnect();
-      },
-      debugLogging,
-      this.plugin.settings.wakeWordThreshold,
-      (msg: string | null) => {
-        // Show a transient notice while assets download on first use.
-        if (msg === null) {
-          // Error during download — dismiss the notice immediately
-          downloadNotice?.hide();
-          downloadNotice = null;
-          return;
-        }
-        if (!downloadNotice) downloadNotice = new Notice(msg, 0);
-        else downloadNotice.setMessage(msg);
-        if (msg === 'Loading models…') {
-          setTimeout(() => { downloadNotice?.hide(); downloadNotice = null; }, 2000);
-        }
-      },
-    );
-    try {
-      this.wakeDetector.start();
-    } catch (err) {
-      (downloadNotice as Notice | null)?.hide();
-      downloadNotice = null;
-      new Notice('Voice: wake word model download failed — check your internet connection.');
-      console.error('[Voice] wake word start failed:', err);
-    }
-    this.updateStatus('idle'); // refresh label — updateStatus reads wakeDetector.isActive()
+    this.plugin.controller.syncWakeWordDetector();
   }
 
-  private async handleConnectToggle(): Promise<void> {
-    return this.toggleConnection();
-  }
-
-  private async doConnect(): Promise<void> {
-    // Stop wake word detection while the real session is active
-    if (this.wakeDetector) {
-      this.wakeDetector.stop();
-      this.wakeDetector = null;
-    }
-
-    const { voice, systemPromptExtra } = this.plugin.settings;
-    const apiKey = this.plugin.app.secretStorage.getSecret(OPENAI_SECRET_ID);
-
-    if (!apiKey) {
-      new Notice('Voice: no OpenAI API key configured. Open Settings to add one.');
-      this.syncWakeWordDetector(); // re-arm the detector
-      return;
-    }
-
-    const view = this.getMarkdownView();
-    const docContent = this.getCurrentDocContent();
-    const claudeThreadsAvailable = this.isClaudeThreadsAvailable();
-    if (claudeThreadsAvailable) {
-      this.notificationBridge = new NotificationBridge();
-    }
-    const { content: contextFilesContent, loadedCount, failedPaths } = await this.loadContextFiles();
-    const systemPrompt = this.buildSystemPrompt(docContent, contextFilesContent, systemPromptExtra, claudeThreadsAvailable);
-
-    // Merge document tools, Claude Threads tools (when available), and voice control tools
-    const allTools = claudeThreadsAvailable
-      ? [...DOCUMENT_TOOLS, ...CLAUDE_THREADS_TOOLS, ...VOICE_CONTROL_TOOLS]
-      : [...DOCUMENT_TOOLS, ...VOICE_CONTROL_TOOLS];
-
-    this.session = new RealtimeSession();
-    this.clearTranscript();
-    this.connectBtn.disabled = true;
-
-    await this.session.connect(apiKey, REALTIME_MODEL, voice, systemPrompt, {
-      onStatusChange: (status) => {
-        this.updateStatus(status);
-        if (status === 'connected') {
-          this.isConnected = true;
-          this.connectBtn.disabled = false;
-          this.connectBtn.textContent = 'Disconnect';
-          this.playChime('connect');
-          // Enter 'listening' with NO silence countdown. The countdown only
-          // arms once a turn actually completes (onSpeechStopped or onAudioDone).
-          // Previously this called resetSilenceTimer() and would disconnect a
-          // user who took >silenceTimeoutSecs to start talking.
-          this.transitionTo('listening', 'connected');
-          // Wire notification bridge now that session is live
-          if (this.notificationBridge && this.session) {
-            const ct = (this.app as any)?.plugins?.plugins?.['claude-threads'] as Record<string, unknown> | null;
-            const manager = ct?.manager as Parameters<NotificationBridge['connect']>[0] | undefined;
-            if (manager) {
-              this.notificationBridge.connect(manager, this.session, this.plugin.settings.debugLogging);
-            }
-          }
-          // Show what file was captured as context
-          if (view?.file) {
-            const chars = docContent.length.toLocaleString();
-            this.addToolEvent(`Context snapshot: ${view.file.name} · ${chars} chars`);
-          } else {
-            this.addToolEvent('Context snapshot: no document open');
-          }
-          // Report context files loaded
-          if (loadedCount > 0) {
-            this.addToolEvent(`Context files: ${loadedCount} file${loadedCount !== 1 ? 's' : ''} loaded`);
-          }
-          if (failedPaths.length > 0) {
-            this.addToolEvent(`Context files: could not load — ${failedPaths.join(', ')}`);
-          }
-        } else if (status === 'idle' || status === 'error') {
-          const wasConnected = this.isConnected;
-          this.isConnected = false;
-          this.connectBtn.disabled = false;
-          this.connectBtn.textContent = 'Connect';
-          // Tear down both watchdog timers so they can't fire after the
-          // session is gone (e.g. network drop while in disconnect-pending).
-          this.clearSilenceTimer();
-          this.clearDisconnectPendingTimer();
-          this.disconnectPendingEl = null;
-          this.disconnectPendingReason = '';
-          this.disconnectPendingPhrase = '';
-          if (wasConnected) this.playChime('disconnect');
-          this.notificationBridge?.disconnect();
-          this.notificationBridge = null;
-          this.session = null;
-          // Re-arm wake word detection now that the session has ended
-          this.syncWakeWordDetector();
-        }
-      },
-      onSpeechStarted: () => {
-        // User started talking. If we were in disconnect-pending, treat this
-        // as an implicit "stay connected" — the user clearly isn't done.
-        if (this.sessionActivity === 'disconnect-pending') {
-          this.cancelDisconnectPending('user_resumed_speaking', /* injectMessage */ false);
-        }
-        this.transitionTo('user-speaking', 'speech_started');
-      },
-      onSpeechStopped: () => {
-        // Server VAD says the user stopped. We don't know yet whether the AI
-        // will respond, so enter 'silence' with the configured countdown.
-        // (Brief mid-sentence pauses re-trigger speech_started, which clears
-        // the countdown again, so this is safe.)
-        this.transitionTo('silence', 'speech_stopped');
-      },
-      onResponseStarted: () => {
-        // New response from the server. If we were in disconnect-pending
-        // (e.g. the AI is producing its goodbye message), don't change state
-        // — the grace timer is the only thing that can complete that path.
-        if (this.sessionActivity === 'disconnect-pending') return;
-        this.transitionTo('ai-responding', 'response.created');
-      },
-      onAudioDone: () => {
-        // AI finished playing audio. Only transition to 'silence' from
-        // 'ai-responding' — if we're in tool-running, an audio_done from
-        // the AI's pre-tool preamble (e.g. "Let me check...") should not
-        // arm the watchdog while the tool is still executing.
-        if (this.sessionActivity === 'tool-running' || this.sessionActivity === 'disconnect-pending') return;
-        this.transitionTo('silence', 'audio_done');
-      },
-      onTranscript: (role, text, done) => {
-        this.handleTranscript(role, text, done);
-      },
-      onToolCall: (callId, name, argsJson) => {
-        // Tool calls are NOT silence-triggering events. Enter 'tool-running'
-        // with no countdown — the tool itself may run for 30–120s. The next
-        // response.created (after flushToolBatch sends response.create) will
-        // transition us out to 'ai-responding'.
-        this.transitionTo('tool-running', `tool_call:${name}`);
-        const label = this.formatToolLabel(name, argsJson);
-        const el = this.addToolEvent(label);
-        this.pendingToolEls.set(callId, el);
-      },
-      onError: (msg) => {
-        new Notice(`Voice error: ${msg}`);
-        this.addToolEvent(`Error: ${msg}`);
-      },
-      getToolResult: async (callId, name, argsJson) => {
-        let args: Record<string, unknown> = {};
-        try {
-          args = JSON.parse(argsJson) as Record<string, unknown>;
-        } catch {
-          return `Error: could not parse tool arguments`;
-        }
-        let result: string;
-        if (name === 'voice_disconnect') {
-          // Don't disconnect immediately. Enter 'disconnect-pending' which
-          // shows a visible abort UI for voiceDisconnectGraceSecs. The user
-          // can click "Stay connected" or just start speaking to cancel.
-          const reason = String(args.reason ?? '').trim() || '(no reason given)';
-          const phrase = String(args.phrase ?? '').trim() || '(no phrase captured)';
-          this.startDisconnectPending(reason, phrase);
-          result = `Disconnect requested. The user has ${this.plugin.settings.voiceDisconnectGraceSecs} seconds to cancel by clicking Stay or speaking. Reason: "${reason}". Phrase heard: "${phrase}".`;
-        } else if (name === 'voice_wait') {
-          const secs = Math.min(Math.max(1, Number(args.seconds) || 5), 300);
-          await new Promise((r) => setTimeout(r, secs * 1000));
-          result = `Waited ${secs} second${secs !== 1 ? 's' : ''}.${args.reason ? ' ' + String(args.reason) : ''}`;
-        } else if (CLAUDE_THREADS_TOOL_NAMES.has(name)) {
-          result = await executeClaudeThreadsTool(name, args, this.app, this.notificationBridge);
-        } else {
-          result = await executeToolCall(name, args, this.app, this.lastMarkdownView);
-        }
-        // Update the pill with outcome
-        const el = this.pendingToolEls.get(callId);
-        if (el) {
-          el.textContent = this.formatToolResult(name, argsJson, result);
-          this.pendingToolEls.delete(callId);
-        }
-        return result;
-      },
-    }, allTools, this.plugin.settings.debugLogging);
-  }
-
-  /**
-   * Single entry point for session-activity state transitions. Always route
-   * through this method — never assign sessionActivity directly. Handles:
-   *   1. Lifecycle logging — every transition is recorded with a reason so
-   *      future complaints can be diagnosed from a console capture alone.
-   *   2. Tearing down the timer of the previous state.
-   *   3. Arming the timer of the next state (silence countdown, disconnect-
-   *      pending grace timer).
-   *   4. Refreshing the status bar.
-   *
-   * Transitions are idempotent except 'silence' (re-arms the countdown) and
-   * 'disconnect-pending' (which is handled separately via startDisconnectPending).
-   */
-  protected transitionTo(next: SessionActivity, reason: string): void {
-    const prev = this.sessionActivity;
-    // Re-entering 'silence' is meaningful — it restarts the countdown.
-    if (prev === next && next !== 'silence') {
-      // Still log the no-op so we can see what triggered it during debugging.
-      console.debug(`[Voice/lifecycle] (no-op) ${prev} → ${next} (${reason})`);
-      return;
-    }
-
-    console.log(`[Voice/lifecycle] ${prev} → ${next} (${reason})`);
-    this.sessionActivity = next;
-
-    // Tear down the silence timer regardless of target state. Only 'silence'
-    // arms it again below.
-    this.clearSilenceTimer();
-
-    if (next === 'silence') {
-      this.armSilenceCountdown();
-    }
-    // disconnect-pending timer is owned by startDisconnectPending/cancelDisconnectPending.
-
-    this.refreshConnectedStatus();
-  }
-
-  /**
-   * Arm the silence countdown using the configured silenceTimeoutSecs. No-op
-   * when the user has disabled it (0). Called only from transitionTo() when
-   * entering 'silence'.
-   */
-  private armSilenceCountdown(): void {
-    const secs = this.plugin.settings.silenceTimeoutSecs;
-    if (!secs) return; // 0 = disabled
-
-    this.silenceSecsLeft = secs;
-    this.refreshConnectedStatus();
-
-    this.countdownInterval = setInterval(() => {
-      this.silenceSecsLeft = Math.max(0, this.silenceSecsLeft - 1);
-      this.refreshConnectedStatus();
-    }, 1000);
-
-    this.silenceTimer = setTimeout(() => {
-      if (!this.isConnected) return;
-      this.clearCountdownInterval();
-      console.log(`[Voice/lifecycle] silence → idle (silence_timeout:${secs}s)`);
-      this.addToolEvent(
-        `Disconnected after ${secs}s of silence — say "hey obsidian" to reconnect`
-      );
-      this.doDisconnect();
-    }, secs * 1000);
-  }
-
-  private clearSilenceTimer(): void {
-    if (this.silenceTimer !== null) {
-      clearTimeout(this.silenceTimer);
-      this.silenceTimer = null;
-    }
-    this.clearCountdownInterval();
-  }
-
-  private clearCountdownInterval(): void {
-    if (this.countdownInterval !== null) {
-      clearInterval(this.countdownInterval);
-      this.countdownInterval = null;
-    }
-  }
-
-  /**
-   * Enter 'disconnect-pending' state with a visible abort UI. Called when
-   * the AI fires the voice_disconnect tool.
-   */
-  protected startDisconnectPending(reason: string, phrase: string): void {
-    const grace = Math.min(30, Math.max(1, this.plugin.settings.voiceDisconnectGraceSecs || 3));
-    this.disconnectPendingReason = reason;
-    this.disconnectPendingPhrase = phrase;
-
-    console.log(`[Voice/lifecycle] ${this.sessionActivity} → disconnect-pending (voice_disconnect reason="${reason}" phrase="${phrase}" grace=${grace}s)`);
-    this.sessionActivity = 'disconnect-pending';
-
-    // Wipe any silence timer so two countdowns don't race.
-    this.clearSilenceTimer();
-    this.clearDisconnectPendingTimer();
-    this.disconnectPendingSecsLeft = grace;
-
-    // Render the abort UI as a transcript event with a button.
-    const el = this.createDisconnectPendingEl(reason, phrase, grace);
-    this.disconnectPendingEl = el;
-    this.refreshConnectedStatus();
-
-    this.disconnectPendingInterval = setInterval(() => {
-      this.disconnectPendingSecsLeft = Math.max(0, this.disconnectPendingSecsLeft - 1);
-      this.updateDisconnectPendingEl();
-      this.refreshConnectedStatus();
-    }, 1000);
-
-    this.disconnectPendingTimer = setTimeout(() => {
-      if (!this.isConnected) return;
-      console.log(`[Voice/lifecycle] disconnect-pending → idle (grace_expired reason="${reason}")`);
-      this.clearDisconnectPendingTimer();
-      this.markDisconnectPendingEl('Disconnected.');
-      this.addToolEvent(`Disconnected by AI · reason: "${reason}"`);
-      this.doDisconnect();
-    }, grace * 1000);
-  }
-
-  /**
-   * Abort a pending disconnect. Triggered by the Stay button, by the user
-   * speaking again, or programmatically (tests, future hooks).
-   *
-   * When triggered by the Stay button, we send a message back to the model
-   * so it knows the user changed their mind. When triggered by speech, we
-   * skip the inject — the user's voice IS the next message.
-   */
-  protected cancelDisconnectPending(via: string, injectMessage: boolean): void {
-    if (this.sessionActivity !== 'disconnect-pending') return;
-    const reason = this.disconnectPendingReason;
-    console.log(`[Voice/lifecycle] disconnect-pending → listening (cancelled via=${via} original_reason="${reason}")`);
-
-    this.clearDisconnectPendingTimer();
-    this.markDisconnectPendingEl(via === 'stay_button'
-      ? 'Stayed connected.'
-      : via === 'user_resumed_speaking'
-        ? 'User resumed speaking — stayed connected.'
-        : 'Disconnect cancelled.');
-
-    if (injectMessage && this.session) {
-      // Use injectUserMessage so an in-flight "OK, goodbye!" response is
-      // cancelled cleanly before the model sees the cancellation.
-      void this.session.injectUserMessage(
-        'I clicked Stay connected. Please continue the conversation — I did not mean to end the session.'
-      );
-    }
-
-    // Don't immediately re-arm a silence countdown; transitionTo will land us
-    // in 'listening' which has no countdown. The next speech_stopped or
-    // audio_done event will arm normally.
-    this.disconnectPendingReason = '';
-    this.disconnectPendingPhrase = '';
-    this.disconnectPendingEl = null;
-    this.transitionTo('listening', `disconnect_cancelled:${via}`);
-  }
-
-  private clearDisconnectPendingTimer(): void {
-    if (this.disconnectPendingTimer !== null) {
-      clearTimeout(this.disconnectPendingTimer);
-      this.disconnectPendingTimer = null;
-    }
-    if (this.disconnectPendingInterval !== null) {
-      clearInterval(this.disconnectPendingInterval);
-      this.disconnectPendingInterval = null;
-    }
-  }
-
-  /** Build the abort UI: panel notice with countdown text + Stay button. */
-  private createDisconnectPendingEl(reason: string, phrase: string, grace: number): HTMLElement {
-    const wrapper = this.transcriptContainer.createDiv({ cls: 'voice-disconnect-pending' });
-    wrapper.createDiv({
-      cls: 'voice-disconnect-pending__title',
-      text: 'AI requested to end the session',
-    });
-    wrapper.createDiv({
-      cls: 'voice-disconnect-pending__meta',
-      text: `Reason: ${reason}`,
-    });
-    if (phrase && phrase !== '(no phrase captured)') {
-      wrapper.createDiv({
-        cls: 'voice-disconnect-pending__meta',
-        text: `Heard: "${phrase}"`,
-      });
-    }
-    const countdownEl = wrapper.createDiv({
-      cls: 'voice-disconnect-pending__countdown',
-      text: `Disconnecting in ${grace}s…`,
-    });
-    countdownEl.dataset.role = 'countdown';
-    const btn = wrapper.createEl('button', {
-      cls: 'voice-disconnect-pending__stay-btn',
-      text: 'Stay connected',
-    });
-    btn.addEventListener('click', () => {
-      this.cancelDisconnectPending('stay_button', /* injectMessage */ true);
-    });
-    this.scrollToBottom();
-    return wrapper;
-  }
-
-  /** Update the countdown text inside the active abort UI. */
-  private updateDisconnectPendingEl(): void {
-    if (!this.disconnectPendingEl) return;
-    const countdownEl = this.disconnectPendingEl.querySelector('[data-role="countdown"]');
-    if (countdownEl) {
-      countdownEl.textContent = `Disconnecting in ${this.disconnectPendingSecsLeft}s…`;
-    }
-  }
-
-  /** Freeze the abort UI to a final state (no button, no countdown). */
-  private markDisconnectPendingEl(finalText: string): void {
-    if (!this.disconnectPendingEl) return;
-    const btn = this.disconnectPendingEl.querySelector('.voice-disconnect-pending__stay-btn');
-    btn?.remove();
-    const countdownEl = this.disconnectPendingEl.querySelector('[data-role="countdown"]') as HTMLElement | null;
-    if (countdownEl) {
-      countdownEl.textContent = finalText;
-      countdownEl.classList.add('voice-disconnect-pending__countdown--final');
-    }
-  }
-
-  /** Re-render the status label without changing the session status. */
-  private refreshConnectedStatus(): void {
-    if (this.isConnected) this.updateStatus('connected');
-  }
-
-  private doDisconnect(): void {
-    this.clearSilenceTimer();
-    this.clearDisconnectPendingTimer();
-    this.disconnectPendingEl = null;
-    this.disconnectPendingReason = '';
-    this.disconnectPendingPhrase = '';
-    if (this.isConnected) this.playChime('disconnect');
-    this.session?.disconnect();
-    this.session = null;
-    this.isConnected = false;
-    this.connectBtn.textContent = 'Connect';
-    this.updateStatus('idle');
-    // Re-arm wake word detection
-    this.syncWakeWordDetector();
-  }
-
-  private getMarkdownView(): MarkdownView | null {
-    return this.lastMarkdownView;
-  }
-
-  private getCurrentDocContent(): string {
-    const view = this.getMarkdownView();
-    if (!view) return '(no document currently open)';
-    return view.editor.getValue();
-  }
-
-  private isClaudeThreadsAvailable(): boolean {
-    // app.plugins is an internal Obsidian API not in the TypeScript types.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return !!((this.app as any)?.plugins?.plugins?.['claude-threads']);
-  }
+  // ── Status rendering ─────────────────────────────────────────────────────
 
   private updateContextBanner(): void {
-    const view = this.getMarkdownView();
+    if (!this.contextBanner) return;
+    const view = this.plugin.controller.lastMarkdownView;
     this.contextBanner.empty();
     if (view?.file) {
       const charCount = view.editor.getValue().length;
@@ -748,101 +146,32 @@ export class VoiceView extends ItemView {
     }
   }
 
-  private buildSystemPrompt(
-    docContent: string,
-    contextFilesContent: string,
-    extra: string,
-    hasClaudeThreads = false
-  ): string {
-    let prompt =
-      'You are a voice assistant helping with an Obsidian document. ' +
-      'The current document content is:\n\n```\n' +
-      docContent +
-      '\n```\n\n' +
-      'You can read it, answer questions about it, and use the available tools to edit it. ' +
-      'Keep responses concise: this is a voice conversation.';
-    if (hasClaudeThreads) {
-      prompt +=
-        '\n\nYou also have access to Claude Threads tools (ct_* prefix). ' +
-        'Use ct_new_thread to start a fresh agent and ct_send_message to reply in an existing thread. ' +
-        'IMPORTANT: When wait=true (default) the tool blocks until the agent finishes and returns the result directly. ' +
-        'When wait=false, the thread runs in the background — and because watch=true by default, ' +
-        'you will automatically receive a spoken notification when it finishes. ' +
-        'You can also call ct_watch/ct_unwatch at any time to control which threads send you notifications. ' +
-        'When you receive a proactive notification about a thread, acknowledge it naturally in your response.';
-    }
-    if (contextFilesContent.trim()) {
-      prompt += '\n\n' + contextFilesContent.trim();
-    }
-    if (extra.trim()) {
-      prompt += '\n\n' + extra.trim();
-    }
-    return prompt;
-  }
-
-  /**
-   * Reads each path in settings.contextFiles from the vault and returns
-   * labeled <context> blocks for injection into the system prompt.
-   */
-  private async loadContextFiles(): Promise<{
-    content: string;
-    loadedCount: number;
-    failedPaths: string[];
-  }> {
-    const paths = this.plugin.settings.contextFiles ?? [];
-    if (paths.length === 0) return { content: '', loadedCount: 0, failedPaths: [] };
-
-    const sections: string[] = [];
-    const failedPaths: string[] = [];
-
-    for (const rawPath of paths) {
-      const path = rawPath.trim();
-      if (!path) continue;
-      try {
-        const abstract = this.app.vault.getAbstractFileByPath(path);
-        if (!(abstract instanceof TFile)) {
-          failedPaths.push(path);
-          continue;
-        }
-        const content = await this.app.vault.read(abstract);
-        sections.push(`<context name="${path}">\n${content}\n</context>`);
-      } catch {
-        failedPaths.push(path);
-      }
-    }
-
-    return {
-      content: sections.join('\n\n'),
-      loadedCount: sections.length,
-      failedPaths,
-    };
-  }
-
   private updateStatus(status: SessionStatus): void {
-    const isListening = !this.isConnected && (this.wakeDetector?.isActive() ?? false);
-    // Wake word enabled but window is not focused — detector is paused.
-    const isFocusPaused = !this.isConnected &&
+    const ctrl = this.plugin.controller;
+    const activity = ctrl.getActivityInfo();
+    const isListening = !ctrl.isConnected && ctrl.isWakeWordActive();
+    const isFocusPaused = !ctrl.isConnected &&
       this.plugin.settings.wakeWordEnabled &&
       this.plugin.wakeDetectorSuspended;
 
     const connectedLabel = (): string => {
-      switch (this.sessionActivity) {
+      switch (activity.activity) {
         case 'user-speaking':       return 'You\'re speaking…';
         case 'ai-responding':       return 'AI responding…';
         case 'tool-running':        return 'AI working…';
-        case 'silence':             return `Silence — ${this.silenceSecsLeft}s`;
-        case 'disconnect-pending':  return `Disconnecting in ${this.disconnectPendingSecsLeft}s · click Stay`;
+        case 'silence':             return `Silence — ${activity.silenceSecsLeft ?? 0}s`;
+        case 'disconnect-pending':  return `Disconnecting in ${activity.disconnectPendingSecsLeft ?? 0}s · click Stay`;
         case 'listening':           return 'Listening';
         default:                    return 'Connected';
       }
     };
     const connectedDot = (): string => {
-      switch (this.sessionActivity) {
-        case 'user-speaking':       return 'voice-status__dot--listening';  // accent pulse
-        case 'ai-responding':       return 'voice-status__dot--connecting'; // yellow pulse
-        case 'tool-running':        return 'voice-status__dot--connecting'; // yellow pulse (still busy)
-        case 'disconnect-pending':  return 'voice-status__dot--error';      // red — about to disconnect
-        default:                    return 'voice-status__dot--connected';   // static green
+      switch (activity.activity) {
+        case 'user-speaking':       return 'voice-status__dot--listening';
+        case 'ai-responding':       return 'voice-status__dot--connecting';
+        case 'tool-running':        return 'voice-status__dot--connecting';
+        case 'disconnect-pending':  return 'voice-status__dot--error';
+        default:                    return 'voice-status__dot--connected';
       }
     };
 
@@ -850,280 +179,132 @@ export class VoiceView extends ItemView {
       idle: isListening
         ? `Listening for "${this.plugin.settings.wakeWord}"…`
         : isFocusPaused
-        ? `Wake word paused — window not in focus`
+        ? 'Wake word paused — window not in focus'
         : 'Idle',
       connecting: 'Connecting…',
-      connected: connectedLabel(),
-      error: 'Error',
+      connected:  ctrl.isConnected ? connectedLabel() : 'Idle',
+      error:      'Error',
     };
+
     const dotClasses: Record<SessionStatus, string> = {
-      idle: isListening ? 'voice-status__dot--listening' : 'voice-status__dot--idle',
+      idle:       isListening ? 'voice-status__dot--listening' : 'voice-status__dot--idle',
       connecting: 'voice-status__dot--connecting',
-      connected: connectedDot(),
-      error: 'voice-status__dot--error',
+      connected:  ctrl.isConnected ? connectedDot() : 'voice-status__dot--idle',
+      error:      'voice-status__dot--error',
     };
 
-    this.statusText.textContent = labels[status];
+    if (this.statusText) this.statusText.textContent = labels[status];
 
-    // Remove all status modifier classes then add the right one
-    for (const cls of [
-      'voice-status__dot--idle',
-      'voice-status__dot--listening',
-      'voice-status__dot--connecting',
-      'voice-status__dot--connected',
-      'voice-status__dot--error',
-    ]) {
-      this.statusDot.removeClass(cls);
+    if (this.statusDot) {
+      for (const cls of [
+        'voice-status__dot--idle',
+        'voice-status__dot--listening',
+        'voice-status__dot--connecting',
+        'voice-status__dot--connected',
+        'voice-status__dot--error',
+      ]) {
+        this.statusDot.removeClass(cls);
+      }
+      this.statusDot.addClass(dotClasses[status]);
     }
-    this.statusDot.addClass(dotClasses[status]);
+
+    if (this.connectBtn) {
+      this.connectBtn.textContent = ctrl.isConnected ? 'Disconnect' : 'Connect';
+      this.connectBtn.disabled = status === 'connecting';
+    }
   }
 
-  private handleTranscript(role: 'user' | 'assistant', text: string, done: boolean): void {
-    if (role === 'assistant') {
-      if (!this.pendingAssistant) {
-        const el = this.createMessageEl('assistant', '');
-        this.pendingAssistant = { role: 'assistant', text: '', el };
-        this.entries.push(this.pendingAssistant);
-      }
-      if (text) {
-        this.pendingAssistant.text += text;
-        this.pendingAssistant.el.querySelector('.voice-msg__text')!.textContent =
-          this.pendingAssistant.text;
-        this.scrollToBottom();
-      }
-      if (done) {
-        this.pendingAssistant = null;
-      }
+  // ── Transcript rendering ─────────────────────────────────────────────────
+
+  private renderTranscriptLine(line: TranscriptLine): void {
+    if (!this.transcriptContainer) return;
+    const existing = this.lineEls.get(line.id);
+    if (existing) {
+      const textEl = existing.querySelector('.voice-msg__text');
+      if (textEl) textEl.textContent = line.text;
     } else {
-      // User transcript arrives complete (done=true always for user)
-      if (!this.pendingUser) {
-        const el = this.createMessageEl('user', text);
-        this.pendingUser = { role: 'user', text, el };
-        this.entries.push(this.pendingUser);
-        this.scrollToBottom();
-      } else {
-        this.pendingUser.text = text;
-        this.pendingUser.el.querySelector('.voice-msg__text')!.textContent = text;
-        this.scrollToBottom();
-      }
-      if (done) {
-        this.pendingUser = null;
-      }
+      const wrapper = this.transcriptContainer.createDiv({
+        cls: `voice-msg voice-msg--${line.role}`,
+      });
+      wrapper.createSpan({ cls: 'voice-msg__label', text: line.role === 'user' ? 'You' : 'AI' });
+      wrapper.createSpan({ cls: 'voice-msg__text', text: line.text });
+      this.lineEls.set(line.id, wrapper);
+      this.scrollToBottom();
     }
   }
 
-  private createMessageEl(role: 'user' | 'assistant', text: string): HTMLElement {
-    const wrapper = this.transcriptContainer.createDiv({
-      cls: `voice-msg voice-msg--${role}`,
-    });
-    wrapper.createSpan({ cls: 'voice-msg__label', text: role === 'user' ? 'You' : 'AI' });
-    wrapper.createSpan({ cls: 'voice-msg__text', text });
-    return wrapper;
-  }
-
-  private addToolEvent(label: string): HTMLElement {
-    const el = this.transcriptContainer.createDiv({
-      cls: 'voice-tool-event',
-      text: label,
-    });
-    this.scrollToBottom();
-    return el;
-  }
-
-  // Label shown while tool is executing
-  private formatToolLabel(name: string, argsJson: string): string {
-    let args: Record<string, unknown> = {};
-    try { args = JSON.parse(argsJson) as Record<string, unknown>; } catch { /* ok */ }
-
-    switch (name) {
-      case 'search_vault':
-        return `Searching vault · "${args.query as string ?? ''}"…`;
-      case 'open_file':
-        return `Opening · ${args.filename as string ?? ''}…`;
-      case 'get_document':
-        return 'Reading document…';
-      case 'append_note':
-        return 'Appending note…';
-      case 'insert_at_cursor':
-        return 'Inserting text…';
-      case 'replace_document':
-        return 'Replacing document…';
-      case 'get_links':
-        return 'Getting links…';
-      case 'create_document':
-        return `Creating document · ${args.path as string ?? ''}…`;
-      case 'list_folder':
-        return `Listing folder · ${args.path as string || '/'}…`;
-      // Claude Threads tools
-      case 'ct_send_message':
-        return `Sending to thread · "${String(args.message ?? '').slice(0, 40)}"…`;
-      case 'ct_new_thread':
-        return `Starting new thread · "${String(args.message ?? '').slice(0, 40)}"…`;
-      case 'ct_wait_for_thread':
-        return `Waiting for thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}…`;
-      case 'ct_get_thread':
-        return `Reading thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}…`;
-      case 'ct_list_threads':
-        return args.status && args.status !== 'all'
-          ? `Listing ${String(args.status)} threads…`
-          : 'Listing threads…';
-      case 'ct_open_thread':
-        return `Opening thread · ${String(args.thread_id ?? '').slice(0, 8)}…`;
-      case 'ct_close_thread':
-        return args.thread_id
-          ? `Closing thread · ${String(args.thread_id).slice(0, 8)}…`
-          : 'Closing active thread…';
-      case 'ct_get_active_thread':
-        return 'Reading active thread…';
-      case 'ct_watch':
-        return args.thread_id
-          ? `Watching thread · ${String(args.thread_id).slice(0, 8)}…`
-          : 'Watching all threads…';
-      case 'ct_unwatch':
-        return args.thread_id
-          ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}…`
-          : 'Stopped watching all threads…';
-      case 'voice_disconnect':
-        return 'Disconnect requested…';
-      case 'voice_wait':
-        return `Waiting ${Number(args.seconds) || 5}s…`;
-      default:
-        return `${name}…`;
+  private renderToolLine(tool: ToolLine): void {
+    if (!this.transcriptContainer) return;
+    const existing = this.lineEls.get(tool.id);
+    if (existing) {
+      existing.textContent = tool.text;
+    } else {
+      const el = this.transcriptContainer.createDiv({
+        cls: 'voice-tool-event',
+        text: tool.text,
+      });
+      this.lineEls.set(tool.id, el);
+      this.scrollToBottom();
     }
   }
 
-  // Label shown after tool completes
-  private formatToolResult(name: string, argsJson: string, result: string): string {
-    let args: Record<string, unknown> = {};
-    try { args = JSON.parse(argsJson) as Record<string, unknown>; } catch { /* ok */ }
+  // ── Disconnect-pending abort UI ──────────────────────────────────────────
 
-    const isError = result.startsWith('Error:');
+  private handleDisconnectPendingEvent(evt: DisconnectPendingEvent): void {
+    if (!this.transcriptContainer) return;
 
-    switch (name) {
-      case 'search_vault': {
-        if (isError) return `Search failed · "${args.query as string ?? ''}"`;
-        const count = (result.match(/^\d+\./gm) ?? []).length;
-        return `Searched vault · "${args.query as string ?? ''}" · ${count} result${count !== 1 ? 's' : ''}`;
+    if (evt.kind === 'started') {
+      // Build a fresh abort UI block.
+      const wrapper = this.transcriptContainer.createDiv({ cls: 'voice-disconnect-pending' });
+      wrapper.createDiv({
+        cls: 'voice-disconnect-pending__title',
+        text: 'AI requested to end the session',
+      });
+      wrapper.createDiv({
+        cls: 'voice-disconnect-pending__meta',
+        text: `Reason: ${evt.reason}`,
+      });
+      if (evt.phrase && evt.phrase !== '(no phrase captured)') {
+        wrapper.createDiv({
+          cls: 'voice-disconnect-pending__meta',
+          text: `Heard: "${evt.phrase}"`,
+        });
       }
-      case 'open_file': {
-        if (isError) return `File not found · ${args.filename as string ?? ''}`;
-        return `Opened · ${args.filename as string ?? ''}`;
+      const countdownEl = wrapper.createDiv({
+        cls: 'voice-disconnect-pending__countdown',
+        text: `Disconnecting in ${evt.graceSecs}s…`,
+      });
+      const btn = wrapper.createEl('button', {
+        cls: 'voice-disconnect-pending__stay-btn',
+        text: 'Stay connected',
+      });
+      btn.addEventListener('click', () => {
+        this.plugin.controller.cancelDisconnectPending('stay_button', /* injectMessage */ true);
+      });
+      this.disconnectPendingEl = wrapper;
+      this.disconnectPendingCountdownEl = countdownEl;
+      this.scrollToBottom();
+    } else if (evt.kind === 'tick') {
+      if (this.disconnectPendingCountdownEl) {
+        this.disconnectPendingCountdownEl.textContent = `Disconnecting in ${evt.secsLeft}s…`;
       }
-      case 'get_document':
-        return isError ? 'Read document · no file open' : 'Read document';
-      case 'append_note':
-        return isError ? 'Append failed' : 'Appended note';
-      case 'insert_at_cursor':
-        return isError ? 'Insert failed' : 'Inserted text';
-      case 'replace_document':
-        return isError ? 'Replace failed' : 'Replaced document';
-      case 'get_links': {
-        if (isError) return 'Got links · no file open';
-        const count = (result.match(/^- /gm) ?? []).length;
-        return `Got links · ${count} link${count !== 1 ? 's' : ''}`;
+    } else if (evt.kind === 'resolved') {
+      if (this.disconnectPendingEl) {
+        const btn = this.disconnectPendingEl.querySelector('.voice-disconnect-pending__stay-btn');
+        btn?.remove();
+        if (this.disconnectPendingCountdownEl) {
+          this.disconnectPendingCountdownEl.textContent = evt.finalText;
+          this.disconnectPendingCountdownEl.classList.add('voice-disconnect-pending__countdown--final');
+        }
       }
-      case 'create_document': {
-        if (isError) return `Create failed · ${args.path as string ?? ''}`;
-        return `Created · ${args.path as string ?? ''}`;
-      }
-      case 'list_folder': {
-        if (isError) return `List failed · ${args.path as string || '/'}`;
-        const count = (result.match(/\n  /g) ?? []).length;
-        return `Listed · ${args.path as string || '/'} · ${count} item${count !== 1 ? 's' : ''}`;
-      }
-      // Claude Threads tools
-      case 'ct_send_message':
-        return isError ? 'Send failed' : 'Sent · agent replied';
-      case 'ct_new_thread':
-        return isError ? 'New thread failed' : 'New thread · agent replied';
-      case 'ct_wait_for_thread':
-        return isError ? 'Wait failed' : 'Thread finished';
-      case 'ct_get_thread': {
-        if (isError) return `Read thread failed`;
-        return `Read thread${args.thread_id ? ` · ${String(args.thread_id).slice(0, 8)}` : ''}`;
-      }
-      case 'ct_list_threads': {
-        if (isError) return 'List threads failed';
-        const countMatch = result.match(/"count":\s*(\d+)/);
-        const n = countMatch ? countMatch[1] : '?';
-        return `Listed ${n} thread${n !== '1' ? 's' : ''}`;
-      }
-      case 'ct_open_thread':
-        return isError ? 'Open thread failed' : 'Opened thread';
-      case 'ct_close_thread':
-        return isError ? 'Close thread failed' : 'Thread closed';
-      case 'ct_get_active_thread':
-        return isError ? 'Read active thread failed' : 'Read active thread';
-      case 'ct_watch':
-        return isError
-          ? 'Watch failed'
-          : args.thread_id
-            ? `Watching · ${String(args.thread_id).slice(0, 8)}`
-            : 'Watching all threads';
-      case 'ct_unwatch':
-        return isError
-          ? 'Unwatch failed'
-          : args.thread_id
-            ? `Stopped watching · ${String(args.thread_id).slice(0, 8)}`
-            : 'Stopped all notifications';
-      case 'voice_disconnect':
-        return 'Disconnect requested · awaiting grace period';
-      case 'voice_wait':
-        return result;
-      default:
-        return isError ? `${name} failed` : name;
+      this.disconnectPendingEl = null;
+      this.disconnectPendingCountdownEl = null;
     }
-  }
-
-  /**
-   * Play a short synthesised chime using the Web Audio API.
-   * connect  → ascending two-note chime  (C5 → G5)
-   * disconnect → descending two-note chime (G5 → C5), quieter
-   */
-  private playChime(type: 'connect' | 'disconnect'): void {
-    try {
-      const ctx = new AudioContext();
-      const master = ctx.createGain();
-      master.gain.value = type === 'connect' ? 0.35 : 0.22;
-      master.connect(ctx.destination);
-
-      // Each note: freq (Hz), start offset (s), total duration (s)
-      const notes: [number, number, number][] =
-        type === 'connect'
-          ? [[523.25, 0, 0.18], [783.99, 0.13, 0.22]] // C5 → G5
-          : [[783.99, 0, 0.14], [523.25, 0.1, 0.22]]; // G5 → C5
-
-      for (const [freq, offset, dur] of notes) {
-        const osc = ctx.createOscillator();
-        const env = ctx.createGain();
-        osc.connect(env);
-        env.connect(master);
-        osc.type = 'sine';
-        osc.frequency.value = freq;
-        const t = ctx.currentTime + offset;
-        env.gain.setValueAtTime(0, t);
-        env.gain.linearRampToValueAtTime(1, t + 0.008); // fast attack
-        env.gain.exponentialRampToValueAtTime(0.001, t + dur); // natural decay
-        osc.start(t);
-        osc.stop(t + dur);
-      }
-
-      // Release the AudioContext once both notes have finished
-      setTimeout(() => ctx.close(), 800);
-    } catch {
-      // AudioContext unavailable — skip sound silently
-    }
-  }
-
-  private clearTranscript(): void {
-    this.transcriptContainer.empty();
-    this.entries = [];
-    this.pendingAssistant = null;
-    this.pendingUser = null;
-    this.pendingToolEls.clear();
   }
 
   private scrollToBottom(): void {
-    this.transcriptContainer.scrollTop = this.transcriptContainer.scrollHeight;
+    if (this.transcriptContainer) {
+      this.transcriptContainer.scrollTop = this.transcriptContainer.scrollHeight;
+    }
   }
 }
