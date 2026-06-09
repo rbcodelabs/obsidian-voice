@@ -316,4 +316,53 @@ describe('RealtimeSession', () => {
       expect(callbacks.onTranscript).not.toHaveBeenCalled();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // output_audio_buffer.* — definitive playback lifecycle from newer Realtime API
+  // -------------------------------------------------------------------------
+
+  describe('output_audio_buffer events', () => {
+    let onAudioDone: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      onAudioDone = vi.fn();
+      callbacks.onAudioDone = onAudioDone;
+    });
+
+    it('fires onAudioDone immediately on output_audio_buffer.stopped', () => {
+      fireEvent(session, { type: 'response.created' }, callbacks);
+      fireEvent(session, { type: 'output_audio_buffer.stopped', response_id: 'r1' }, callbacks);
+      expect(onAudioDone).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires onAudioDone immediately on output_audio_buffer.cleared (barge-in)', () => {
+      fireEvent(session, { type: 'response.created' }, callbacks);
+      fireEvent(session, { type: 'output_audio_buffer.cleared', response_id: 'r1' }, callbacks);
+      expect(onAudioDone).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not double-fire if both output_audio_buffer.stopped and response.output_audio.done arrive', () => {
+      fireEvent(session, { type: 'response.created' }, callbacks);
+      fireEvent(session, { type: 'output_audio_buffer.stopped', response_id: 'r1' }, callbacks);
+      // The legacy event firing after the new one shouldn't trigger again
+      // because audioDoneFired is now true.
+      fireEvent(session, { type: 'response.output_audio.done', response_id: 'r1' }, callbacks);
+      expect(onAudioDone).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels in-flight playback polling on output_audio_buffer.stopped', () => {
+      fireEvent(session, { type: 'response.created' }, callbacks);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (session as any).playbackWaitPending = true;
+      fireEvent(session, { type: 'output_audio_buffer.stopped', response_id: 'r1' }, callbacks);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((session as any).playbackWaitPending).toBe(false);
+    });
+
+    it('does not log output_audio_buffer.started as audio-done', () => {
+      fireEvent(session, { type: 'response.created' }, callbacks);
+      fireEvent(session, { type: 'output_audio_buffer.started', response_id: 'r1' }, callbacks);
+      expect(onAudioDone).not.toHaveBeenCalled();
+    });
+  });
 });
