@@ -795,12 +795,25 @@ export class VoiceController {
     if (hasClaudeThreads) {
       prompt +=
         '\n\nYou also have access to Claude Threads tools (ct_* prefix). ' +
-        'Use ct_new_thread to start a fresh agent and ct_send_message to reply in an existing thread. ' +
-        'IMPORTANT: When wait=true (default) the tool blocks until the agent finishes and returns the result directly. ' +
-        'When wait=false, the thread runs in the background — and because watch=true by default, ' +
-        'you will automatically receive a spoken notification when it finishes. ' +
-        'You can also call ct_watch/ct_unwatch at any time to control which threads send you notifications. ' +
-        'When you receive a proactive notification about a thread, acknowledge it naturally in your response.';
+        'Use ct_new_thread to start a fresh agent and ct_send_message to reply in an existing thread.' +
+        '\n\n== Async thread rules — read carefully ==' +
+        '\n• When you call ct_send_message or ct_new_thread with wait=true (default), the tool BLOCKS ' +
+        'until the agent finishes and returns the final result to you directly. You handle it in one turn.' +
+        '\n• When wait=false, the thread runs in the BACKGROUND. The tool returns immediately with just the ' +
+        'thread ID — NOT the result. The agent is still working.' +
+        '\n• For background threads, you will receive EXACTLY ONE proactive voice notification per thread, ' +
+        'and only when the thread has FINISHED (done or error). You will never be notified about partial ' +
+        'progress, tool calls the agent is making, or intermediate messages. Mid-stream updates are ' +
+        'deliberately hidden from you.' +
+        '\n• Therefore: if you have NOT received a completion notification, the thread is still working. ' +
+        'DO NOT ask the user "are you still working?" or "is it done yet?" — the user already sees live ' +
+        'progress in the Claude Threads panel. DO NOT send follow-up ct_send_message calls to the same ' +
+        'thread while it is still running; that just queues another request behind the current one.' +
+        '\n• If the user explicitly asks for a progress check, call ct_get_thread(thread_id) to read the ' +
+        'current message log. Do NOT poll proactively.' +
+        '\n• When a completion notification arrives, acknowledge it briefly and naturally, then either ' +
+        'summarize the result or ask the user what they want to do next. Do NOT recite the entire ' +
+        'final message verbatim — paraphrase the key point.';
     }
     if (contextFilesContent.trim()) {
       prompt += '\n\n' + contextFilesContent.trim();

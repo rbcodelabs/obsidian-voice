@@ -10,6 +10,7 @@ interface Thread {
 type SubscribableManager = {
   getThread: (id: string) => Thread | undefined;
   getThreads: () => Thread[];
+  isRunning: (id: string) => boolean;
   subscribe: (listener: (threadId: string, event: { type: string }) => void) => () => void;
 };
 
@@ -60,7 +61,7 @@ export class NotificationBridge {
   }
 
   private handleCtEvent(threadId: string, event: { type: string }): void {
-    if (this.debug) console.debug(`[Voice Bridge] CT event: type="${event.type}" threadId="${threadId}" watched=${this.watchedThreads.has(threadId)}`);
+    if (this.debug) console.debug(`[Voice Bridge] CT event: type="${event.type}" threadId="${threadId}" watched=${this.watchedThreads.has(threadId)} running=${this.manager?.isRunning(threadId)}`);
     if (!this.watchedThreads.has(threadId)) return;
     if (!this.session) return;
 
@@ -72,13 +73,29 @@ export class NotificationBridge {
     let text: string | null = null;
 
     if (event.type === 'done') {
-      text = `Thread "${title}" has finished.${preview ? ' Last message: ' + preview : ''}`;
+      // Terminal event: thread finished. Always notify, with the final message.
+      text = `Thread "${title}" has finished. Final message: ${preview || '(no message)'}`;
     } else if (event.type === 'error') {
       const err = thread?.lastError ?? 'unknown error';
       text = `Thread "${title}" encountered an error: ${err}`;
     } else if (event.type === 'message') {
+      // CRITICAL: 'message' events fire on every assistant chunk, tool-call,
+      // and tool-result while the agent is mid-work. If we notify on each one,
+      // the voice agent interrupts itself constantly with "Thread X update:…"
+      // and starts asking the user follow-up questions about partial output.
+      //
+      // Only surface a 'message' event if the thread is no longer running —
+      // i.e. the agent posted a final message but the 'done' event hasn't
+      // arrived yet (or won't). All in-flight chatter stays silent. The user
+      // can still see live progress in the Claude Threads panel; the voice
+      // agent only gets a single completion notification.
+      const isStillWorking = this.manager?.isRunning(threadId) ?? false;
+      if (isStillWorking) {
+        if (this.debug) console.debug(`[Voice Bridge] Suppressing in-progress message for thread "${title}" — agent still working`);
+        return;
+      }
       if (preview) {
-        text = `Thread "${title}" update: ${preview}`;
+        text = `Thread "${title}" posted: ${preview}`;
       }
     }
 
