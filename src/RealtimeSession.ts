@@ -308,7 +308,11 @@ export class RealtimeSession {
       const name = (event.name as string) ?? '';
       const argsJson = (event.arguments as string) ?? '{}';
       console.debug(`[Voice] Tool call buffered: ${name} (${callId}) — pendingTools now ${this.pendingToolCalls.length + 1}`);
-      callbacks.onToolCall(callId, name, argsJson);
+      // Don't surface notification_acknowledged as a tool-running state transition —
+      // it's a silent ack and should be invisible to the user.
+      if (name !== 'notification_acknowledged') {
+        callbacks.onToolCall(callId, name, argsJson);
+      }
       this.pendingToolCalls.push({ callId, name, argsJson });
     } else if (type === 'response.done') {
       this.isResponseActive = false;
@@ -532,11 +536,18 @@ export class RealtimeSession {
   }
 
   private async flushToolBatch(batch: PendingToolCall[], callbacks: SessionCallbacks): Promise<void> {
-    // Run all tools in the batch concurrently. These can take 30-120s for
+    // Separate silent acks from real tools. notification_acknowledged is handled
+    // entirely client-side: no getToolResult, no response.create. After sending
+    // the function_call_output we fire onAudioDone so VoiceController transitions
+    // back to 'silence' — which also resets the auto-disconnect silence timer.
+    const silentAcks = batch.filter(t => t.name === 'notification_acknowledged');
+    const realTools  = batch.filter(t => t.name !== 'notification_acknowledged');
+
+    // Run real tools in the batch concurrently. These can take 30-120s for
     // slow tools (e.g. ct_new_thread / ct_send_message), during which VAD
     // may fire and start a new response.
     const results = await Promise.all(
-      batch.map(async ({ callId, name, argsJson }) => {
+      realTools.map(async ({ callId, name, argsJson }) => {
         try {
           const result = await callbacks.getToolResult(callId, name, argsJson);
           console.debug('[Voice] Tool result:', name, result.slice(0, 200));
@@ -562,14 +573,33 @@ export class RealtimeSession {
       if (!this.dc || this.dc.readyState !== 'open') return;
     }
 
-    // Send all outputs first, then exactly one response.create
-    for (const { callId, output } of results) {
+    // Always send silent-ack outputs to keep conversation history consistent.
+    for (const { callId } of silentAcks) {
       this.dc.send(JSON.stringify({
         type: 'conversation.item.create',
-        item: { type: 'function_call_output', call_id: callId, output },
+        item: { type: 'function_call_output', call_id: callId, output: '{"status":"noted"}' },
       }));
     }
-    this.dc.send(JSON.stringify({ type: 'response.create' }));
+
+    if (realTools.length > 0) {
+      // Send real tool outputs then exactly one response.create.
+      for (const { callId, output } of results) {
+        this.dc.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: { type: 'function_call_output', call_id: callId, output },
+        }));
+      }
+      this.dc.send(JSON.stringify({ type: 'response.create' }));
+    } else {
+      // Only silent acks — return to silence without asking the model to speak.
+      // Fire onAudioDone to drive VoiceController back to 'silence', which
+      // clears and restarts the auto-disconnect silence timer.
+      if (this.debug) console.debug('[Voice] notification_acknowledged only — skipping response.create, firing onAudioDone to reset silence timer');
+      if (!this.audioDoneFired) {
+        this.audioDoneFired = true;
+        callbacks.onAudioDone?.();
+      }
+    }
   }
 
   injectNotification(threadId: string, text: string): void {

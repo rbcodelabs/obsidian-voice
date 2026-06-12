@@ -69,6 +69,24 @@ export type DisconnectPendingEvent =
 const VOICE_CONTROL_TOOLS = [
   {
     type: 'function',
+    name: 'notification_acknowledged',
+    description:
+      'Call this to silently acknowledge a background update or notification that does not need a spoken response. ' +
+      'Use it when you receive a context update, a thread progress notification, or any background information ' +
+      'where speaking would be unnecessary or disruptive. Calling this keeps the session alive and resets the ' +
+      'auto-disconnect silence timer without producing any audio.',
+    parameters: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Optional internal note on why you are not responding verbally.',
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
     name: 'voice_disconnect',
     description:
       'End the voice session. ONLY call this when the user has CLEARLY AND EXPLICITLY asked ' +
@@ -817,7 +835,10 @@ export class VoiceController {
         'like done. The agent is not currently working but the thread is also not formally finished.' +
         '\n• NEVER ask the user "is the thread still working?" or "is it done yet?" — the notifications ' +
         'already tell you. NEVER poll ct_get_thread proactively. Call it only when the user explicitly ' +
-        'asks for a status check or for the full transcript of a thread.';
+        'asks for a status check or for the full transcript of a thread.' +
+        '\n• When you receive a background notification and do NOT need to say anything, call ' +
+        'notification_acknowledged instead of staying silent. This resets the auto-disconnect timer ' +
+        'so the session stays alive while threads are still running.';
     }
     if (contextFilesContent.trim()) {
       prompt += '\n\n' + contextFilesContent.trim();
